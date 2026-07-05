@@ -1,0 +1,77 @@
+{
+  "module": "Genswarms.Observer.Objects.Scope",
+  "note": "Registry + tick + deterministic detectors over other swarms' dashboards (cron seed -> tick). Consumed as a mix dep.",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "swarm_name": {
+        "type": "string",
+        "description": "Swarm this object logs/delivers under."
+      },
+      "name": {
+        "type": "string",
+        "description": "Object name in the topology (default: scope)."
+      },
+      "registry": {
+        "type": "object",
+        "x-mutable": true,
+        "description": "Observed swarms: name -> {dashboard_url, token_env, repo}. token_env is the NAME of an env var (x-secret contract, section 14.2.1) — never a token literal. Hot-add a swarm to watch by patching this map.",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "dashboard_url": { "type": "string", "description": "Dashboard backend base URL (e.g. http://127.0.0.1:4994)." },
+            "token_env": { "type": "string", "description": "Env var NAME holding the dashboard bearer token; omit for loopback dashboards." },
+            "repo": { "type": "string", "description": "GitHub org/repo of the observed swarm, linked in alert cards." }
+          }
+        }
+      },
+      "thresholds": {
+        "type": "object",
+        "x-mutable": true,
+        "description": "Detector tuning overrides: stall_minutes (10), error_burst_count (5), error_burst_window_s (60), pool_saturated_s (120)."
+      },
+      "cooldown_minutes": {
+        "type": "integer",
+        "default": 30,
+        "x-mutable": true,
+        "description": "Minimum minutes between two alerts of the same (swarm, type) — the anti-storm dedupe window."
+      },
+      "alert_conversation_id": {
+        "type": "string",
+        "x-mutable": true,
+        "description": "Telegram conversation the alert cards go to (sender's conversation_id)."
+      },
+      "tick_sources": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Nodes allowed to trigger tick (fail-closed allowlist; normally just cron)."
+      },
+      "read_sources": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Nodes allowed to call status/get_dashboard/get_events (fail-closed allowlist; the diagnosis agent)."
+      },
+      "sender": {
+        "type": "string",
+        "description": "Topology object that receives alert cards (default: sender)."
+      },
+      "client": {
+        "type": "string",
+        "description": "Client adapter module (default Genswarms.Observer.Client.Http)."
+      },
+      "client_opts": {
+        "type": "array",
+        "description": "Extra adapter opts (timeout_ms, fake pid in tests)."
+      },
+      "now_fn": {
+        "type": "string",
+        "description": "Injectable clock (tests only)."
+      },
+      "deliver_fn": {
+        "type": "string",
+        "description": "Injectable delivery seam to the sender (tests only; default engine ObjectServer)."
+      }
+    },
+    "required": ["registry"]
+  }
+}

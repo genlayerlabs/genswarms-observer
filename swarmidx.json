@@ -1,0 +1,15 @@
+{
+  "registry": {
+    "scope": "genlayerlabs"
+  },
+  "packages": [
+    {
+      "name": "genswarms-observer",
+      "dir": ".",
+      "kind": "handler",
+      "description": "Observer scope object: deterministic health detectors (stall, error_burst, budget_block, endpoint_down, pool_saturated) over other swarms' dashboards, with cooldown-deduped Telegram alert cards",
+      "module": "Genswarms.Observer.Objects.Scope",
+      "note": "kind:handler for v0.2 (the :scope object). The full kind:swarm packaging (cron+scope+sender IR) lands when the diagnosis agent (fase 3) matures."
+    }
+  ]
+}
