@@ -6,6 +6,10 @@
 #
 # (GENSWARMS_PATH activa la dep del engine en mix.exs — el paquete publicado
 # no compila contra el engine.)
+#
+# OJO: `mix deps.get` con GENSWARMS_PATH engorda mix.lock con las deps hex del
+# engine. NO commitear ese lock: el del repo se genera SIN el env
+# (rm mix.lock && mix deps.get) para que el paquete quede limpio.
 
 {:ok, _} = Application.ensure_all_started(:crypto)
 {:ok, _} = Application.ensure_all_started(:inets)
