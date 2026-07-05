@@ -209,6 +209,49 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Jason.decode!(delivery.content)["card"]["title"] =~ "endpoint_down"
   end
 
+  # ── escalada (fase 3) ─────────────────────────────────────────────────────
+
+  test "with escalate_to set, an emitted alert also becomes a diagnosis task" do
+    %{state: state, outbox: outbox} =
+      start_scope(
+        fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}},
+        config: %{escalate_to: :diagnostico}
+      )
+
+    {reply, _} = decode_reply(tick(state))
+    assert reply["alerts"] == 1
+
+    assert [card, task] = sent(outbox)
+    assert card.target == :sender
+    assert task.target == :diagnostico
+    assert task.content =~ "endpoint_down"
+    assert task.content =~ ~s({"action":"get_events","swarm":"wingston"})
+    assert task.content =~ "NO tienes red"
+  end
+
+  test "escalation respects the cooldown (a suppressed alert does not escalate)" do
+    %{state: state, outbox: outbox} =
+      start_scope(
+        fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}},
+        config: %{escalate_to: :diagnostico}
+      )
+
+    {_, state} = decode_reply(tick(state))
+    {reply, _} = decode_reply(tick(state))
+
+    assert reply["suppressed"] == 1
+    # one card + one escalation from the FIRST tick only
+    assert length(sent(outbox)) == 2
+  end
+
+  test "without escalate_to nothing is escalated (default off)" do
+    %{state: state, outbox: outbox} =
+      start_scope(fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}})
+
+    {_, _} = decode_reply(tick(state))
+    assert [%{target: :sender}] = sent(outbox)
+  end
+
   # ── tokens ────────────────────────────────────────────────────────────────
 
   test "token_env resolves through the environment at fetch time" do

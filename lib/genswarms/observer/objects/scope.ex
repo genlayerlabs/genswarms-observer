@@ -41,6 +41,7 @@ defmodule Genswarms.Observer.Objects.Scope do
       tick_sources: MapSet.new(cfg(config, :tick_sources, []) |> Enum.map(&to_string/1)),
       read_sources: MapSet.new(cfg(config, :read_sources, []) |> Enum.map(&to_string/1)),
       sender: node_ref(cfg(config, :sender, :sender)),
+      escalate_to: escalate_ref(cfg(config, :escalate_to, nil)),
       alert_conversation_id: cfg(config, :alert_conversation_id, nil),
       client: module_ref(cfg(config, :client, Genswarms.Observer.Client.Http)),
       client_opts: cfg(config, :client_opts, []),
@@ -218,11 +219,45 @@ defmodule Genswarms.Observer.Objects.Scope do
         )
     end
 
+    escalate(state, alert)
+
     %{
       state
       | last_alert: Map.put(state.last_alert, {alert.swarm, alert.type}, alert.at_ms),
         alerts: Enum.take([alert | state.alerts], @alerts_kept)
     }
+  end
+
+  # Fase 3: la misma alerta (ya deduplicada por cooldown) se escala como TAREA
+  # al agente de diagnóstico. El agente no tiene red hacia los swarms — el
+  # prompt le recuerda que pregunte a :scope por la topología.
+  defp escalate(%{escalate_to: nil}, _alert), do: :ok
+
+  defp escalate(state, alert) do
+    task = """
+    ALERTA del observer — diagnostica.
+    swarm: #{alert.swarm}
+    tipo: #{alert.type}
+    resumen: #{alert.summary}
+    evidencia: #{Jason.encode!(alert.evidence)}
+
+    NO tienes red hacia los swarms. Pide los datos a `scope` con swarm-msg ask:
+      {"action":"get_dashboard","swarm":"#{alert.swarm}"}
+      {"action":"get_events","swarm":"#{alert.swarm}"}
+      {"action":"status"}
+    Redacta un diagnóstico: síntoma, evidencia concreta, hipótesis y
+    siguiente paso accionable.
+    """
+
+    case state.deliver_fn.(state.escalate_to, state.name, task) do
+      :ok ->
+        :ok
+
+      other ->
+        Logger.warning(
+          "[observer] escalation to #{inspect(state.escalate_to)} returned #{inspect(other)}"
+        )
+    end
   end
 
   defp alert_card(alert, entry) do
@@ -344,6 +379,10 @@ defmodule Genswarms.Observer.Objects.Scope do
       end
     end
   end
+
+  defp escalate_ref(nil), do: nil
+  defp escalate_ref(""), do: nil
+  defp escalate_ref(name), do: node_ref(name)
 
   # Topology node names arrive as atoms (Elixir defs) or strings (JSON IR).
   # Strings resolve via to_existing_atom — cron's pattern, no atom minting.

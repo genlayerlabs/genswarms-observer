@@ -17,6 +17,8 @@ root = Path.expand("..", __DIR__)
 :persistent_term.put({:observer_smoke, :telegram_fake}, telegram_fake)
 
 System.put_env("OBSERVER_SMOKE", "1")
+# puerto propio: no chocar con un observer vivo en :4996
+System.put_env("OBSERVER_DASHBOARD_PORT", "4997")
 System.put_env("OBSERVER_TELEGRAM_BOT_TOKEN", "0000000000:smoke-dummy")
 System.put_env("OBSERVER_ALERT_CONVERSATION_ID", "tg:1:0")
 # el seed job no debe disparar solo durante el smoke (29 de febrero)

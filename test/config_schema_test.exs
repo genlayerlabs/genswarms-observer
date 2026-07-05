@@ -5,7 +5,7 @@ defmodule Genswarms.Observer.ConfigSchemaTest do
   # the schema<->init conformance below catches drift in either direction
   @init_keys ~w(swarm_name name registry thresholds cooldown_minutes
                 alert_conversation_id tick_sources read_sources sender
-                client client_opts now_fn deliver_fn)
+                escalate_to client client_opts now_fn deliver_fn)
 
   defp schema do
     Path.join(__DIR__, "../swarm-object.json")
@@ -55,6 +55,7 @@ defmodule Genswarms.Observer.ConfigSchemaTest do
     refute "tick_sources" in mutable
     refute "read_sources" in mutable
     refute "sender" in mutable
+    refute "escalate_to" in mutable
   end
 
   test "a config drawn from the schema boots the handler" do

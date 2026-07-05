@@ -52,18 +52,58 @@ sender_client =
     ],
     else: []
 
-%{
-  name: "observer",
-  # fase 3: :diagnostico pasa de :mock a bwrap network: :isolated. Hoy es el
-  # placeholder que el engine exige (un swarm sin agentes no arranca) y el
-  # consumidor allowlisted de las lecturas de :scope.
-  agents: [
+# :diagnostico (fase 3): body bwrap con red AISLADA — sin red salvo el
+# forwarder clavado al router unhardcoded (el modelo lo elige la Σ_pol,
+# nunca se nombra aquí; la consumer key entra por env, jamás literal).
+# Los datos de los swarms se los pide a :scope por la topología.
+# Sin UNHARDCODED_CONSUMER_KEY (o en smoke) degrada a :mock para que el
+# boot smoke y los hosts sin sandbox sigan funcionando.
+diagnostico =
+  if not smoke? and (System.get_env("UNHARDCODED_CONSUMER_KEY") || "") != "" do
+    %{
+      name: :diagnostico,
+      backend: :bwrap,
+      # URL COMPLETA: szc postea al endpoint tal cual — con la base /v1 a
+      # secas el turno muere en silencio (gotcha de config.example de szc)
+      endpoint: "https://router.ygr.ai/v1/chat/completions",
+      skills: [Path.join(__DIR__, "skills/diagnostico.md")],
+      config: %{
+        network: :isolated,
+        api_key: System.get_env("UNHARDCODED_CONSUMER_KEY"),
+        # parámetros de subzeroclaw: el diagnóstico es acotado por diseño.
+        # OJO: max_turns via config del backend mata el sandbox en este host
+        # (exit 1 al arrancar, A/B verificado) — pendiente issue al engine;
+        # el default de szc (200) acota igualmente el loop.
+        # max_turns: 24,
+        # sin "model": contra el router la Σ_pol decide; un model literal
+        # aquí sería precisamente lo que unhardcoded existe para evitar
+        request_extra: %{
+          "policy_ir" =>
+            Jason.decode!(File.read!(Path.join(__DIR__, "policies/diagnostico.policy.json")))
+        },
+        # sesión de larga vida (cada escalada se acumula): el sealing lo hace
+        # el ROUTER en /v1/compact cuando él decide (x_router.compact) — szc
+        # solo transporta keep_recent + la Σ_pol barata del summariser
+        compact_extra: %{
+          "keep_recent" => 8,
+          "policy_ir" =>
+            Jason.decode!(
+              File.read!(Path.join(__DIR__, "policies/diagnostico.compact.policy.json"))
+            )
+        }
+      }
+    }
+  else
     %{
       name: :diagnostico,
       backend: :mock,
       skills: [Path.join(__DIR__, "skills/diagnostico.md")]
     }
-  ],
+  end
+
+%{
+  name: "observer",
+  agents: [diagnostico],
   objects: [
     %{
       name: :cron,
@@ -98,7 +138,8 @@ sender_client =
             alert_conversation_id: System.get_env("OBSERVER_ALERT_CONVERSATION_ID"),
             tick_sources: ["cron"],
             read_sources: ["diagnostico"],
-            sender: :sender
+            sender: :sender,
+            escalate_to: :diagnostico
           },
           Map.new(scope_client)
         )

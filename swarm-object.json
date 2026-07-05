@@ -55,6 +55,10 @@
         "type": "string",
         "description": "Topology object that receives alert cards (default: sender)."
       },
+      "escalate_to": {
+        "type": "string",
+        "description": "Topology agent that receives each (cooldown-deduped) alert as a diagnosis task (fase 3; unset = no escalation). Trust surface — not hot-mutable."
+      },
       "client": {
         "type": "string",
         "description": "Client adapter module (default Genswarms.Observer.Client.Http)."

@@ -1,0 +1,42 @@
+[
+  "policy",
+  [
+    "and",
+    [
+      "meets_req"
+    ],
+    [
+      "not",
+      [
+        "is",
+        "disabled"
+      ]
+    ]
+  ],
+  [
+    "neg",
+    [
+      "add",
+      [
+        "field",
+        "price_in"
+      ],
+      [
+        "field",
+        "price_out"
+      ]
+    ]
+  ],
+  [
+    "argmax"
+  ],
+  [
+    "id"
+  ],
+  [
+    "always",
+    {
+      "action": "next_candidate"
+    }
+  ]
+]
