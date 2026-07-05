@@ -1,18 +1,21 @@
-# observer — el swarm que vigila swarms (v0.2: cron -> scope -> sender).
+# observer — the swarm that watches swarms (v0.2: cron -> scope -> sender).
 #
-# Sin agentes: la detección es determinista (Genswarms.Observer.Detectors);
-# el LLM solo entra en fase 3 (:diagnostico). El único que abre sockets es
-# :scope; los tokens viajan como NOMBRES de env vars.
+# Detection is deterministic (Genswarms.Observer.Detectors); the LLM only
+# enters at fase 3 (:diagnostico). The only node that opens sockets is
+# :scope; tokens travel as env var NAMES.
 #
 # Env:
-#   OBSERVER_REGISTRY_JSON          registry completo como JSON (si falta, el
-#                                   target de dev de dev/start-target.sh)
-#   OBSERVER_TARGET_DASHBOARD_URL   base del target de dev (default :4994)
-#   OBSERVER_TICK_CRON              cadencia del tick (default cada 5 min)
-#   OBSERVER_TELEGRAM_BOT_TOKEN     token del bot (via bot_token_env, no literal)
-#   OBSERVER_ALERT_CONVERSATION_ID  chat destino de las alert cards
-#   OBSERVER_COOLDOWN_MINUTES       anti-tormenta por (swarm, tipo) (default 30)
-#   OBSERVER_SMOKE                  "1" -> fakes desde :persistent_term (boot smoke)
+#   OBSERVER_REGISTRY_JSON          full registry as JSON (unset -> the
+#                                   dev target from dev/start-target.sh)
+#   OBSERVER_TARGET_DASHBOARD_URL   dev target base (default :4994)
+#   OBSERVER_TICK_CRON              tick cadence (default every 5 min)
+#   OBSERVER_TELEGRAM_BOT_TOKEN     bot token (via bot_token_env, never literal)
+#   OBSERVER_ALERT_CONVERSATION_ID  destination chat for alert cards
+#   OBSERVER_COOLDOWN_MINUTES       per (swarm, type) anti-storm (default 30)
+#   OBSERVER_TELEGRAM_DRY_RUN       "1" -> sender records but never hits Telegram
+#   OBSERVER_SMOKE                  "1" -> fakes from :persistent_term (boot smoke)
+#   UNHARDCODED_CONSUMER_KEY        router consumer key; unset -> :diagnostico
+#                                   degrades to :mock
 
 registry =
   case System.get_env("OBSERVER_REGISTRY_JSON") do
@@ -52,38 +55,37 @@ sender_client =
     ],
     else: []
 
-# :diagnostico (fase 3): body bwrap con red AISLADA — sin red salvo el
-# forwarder clavado al router unhardcoded (el modelo lo elige la Σ_pol,
-# nunca se nombra aquí; la consumer key entra por env, jamás literal).
-# Los datos de los swarms se los pide a :scope por la topología.
-# Sin UNHARDCODED_CONSUMER_KEY (o en smoke) degrada a :mock para que el
-# boot smoke y los hosts sin sandbox sigan funcionando.
+# :diagnostico (fase 3): bwrap body with ISOLATED network — no network except
+# the forwarder pinned to the unhardcoded router (the model is chosen by the
+# Σ_pol, never named here; the consumer key enters via env, never literal).
+# It gets swarm data by asking :scope through the topology.
+# Without UNHARDCODED_CONSUMER_KEY (or in smoke) it degrades to :mock so the
+# boot smoke and sandbox-less hosts keep working.
 diagnostico =
   if not smoke? and (System.get_env("UNHARDCODED_CONSUMER_KEY") || "") != "" do
     %{
       name: :diagnostico,
       backend: :bwrap,
-      # URL COMPLETA: szc postea al endpoint tal cual — con la base /v1 a
-      # secas el turno muere en silencio (gotcha de config.example de szc)
+      # FULL URL: szc posts to the endpoint as-is — with the bare /v1 base
+      # the turn dies silently (szc config.example gotcha); /v1/compact is
+      # derived from this URL too.
       endpoint: "https://router.ygr.ai/v1/chat/completions",
       skills: [Path.join(__DIR__, "skills/diagnostico.md")],
       config: %{
         network: :isolated,
         api_key: System.get_env("UNHARDCODED_CONSUMER_KEY"),
-        # Sin max_turns: el default de szc (200) ya acota el loop de tools
-        # por tarea, y el contexto lo gestiona la autocompactación del router
-        # (compact_extra) — un presupuesto arbitrario aquí solo puede truncar
-        # trabajo legítimo. (Si algún día hace falta, requiere engine ≥ #79:
-        # antes, CUALQUIER agente bwrap con max_turns moría al arrancar.)
-        # sin "model": contra el router la Σ_pol decide; un model literal
-        # aquí sería precisamente lo que unhardcoded existe para evitar
+        # No max_turns: szc's default (200) already bounds the tool loop per
+        # task, and CONTEXT is the router's auto-compaction business
+        # (compact_extra) — an arbitrary budget here can only truncate
+        # legitimate work. (If ever needed, requires engine >= #79: before
+        # it, ANY bwrap agent with max_turns died at launch.)
         request_extra: %{
           "policy_ir" =>
             Jason.decode!(File.read!(Path.join(__DIR__, "policies/diagnostico.policy.json")))
         },
-        # sesión de larga vida (cada escalada se acumula): el sealing lo hace
-        # el ROUTER en /v1/compact cuando él decide (x_router.compact) — szc
-        # solo transporta keep_recent + la Σ_pol barata del summariser
+        # long-lived session (escalations accumulate): sealing is done by the
+        # ROUTER at /v1/compact when IT decides (x_router.compact) — szc only
+        # carries keep_recent + the cheap summariser Σ_pol
         compact_extra: %{
           "keep_recent" => 8,
           "policy_ir" =>
@@ -110,7 +112,7 @@ diagnostico =
       handler: Genswarms.Cron,
       config: %{
         swarm_name: "observer",
-        # nadie crea jobs en runtime; el seed job es todo el producto
+        # nobody creates jobs at runtime; the seed job is the whole product
         trusted_sources: [],
         allowed_targets: %{scope: ["tick"]},
         seed_jobs: [
@@ -159,8 +161,8 @@ diagnostico =
         )
     }
   ] ++
-    # el observer también es observable: su propio dashboard, solo si el
-    # paquete está cargado (dep live-only; el paquete publicado no lo exige)
+    # the observer is observable too: its own dashboard, only when the
+    # package is loaded (live-only dep; the published package doesn't require it)
     (if Code.ensure_loaded?(GenswarmsDashboard.Objects.Dashboard) do
        [
          %{
@@ -169,7 +171,7 @@ diagnostico =
            config: %{
              swarm: "observer",
              port: System.get_env("OBSERVER_DASHBOARD_PORT") || "4996",
-             dashboard_title: "observer · el swarm que vigila swarms"
+             dashboard_title: "observer · the swarm that watches swarms"
            }
          }
        ]
@@ -178,8 +180,8 @@ diagnostico =
      end),
   topology: [
     {:cron, :scope},
-    # la respuesta del tick (contadores) vuelve a cron; sin esta arista el
-    # router la descarta con "invalid route"
+    # the tick reply (counters) goes back to cron; without this edge the
+    # router drops it with "invalid route"
     {:scope, :cron},
     {:scope, :sender},
     {:diagnostico, :scope},

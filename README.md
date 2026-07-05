@@ -1,52 +1,62 @@
 # genswarms-observer
 
-El swarm que vigila swarms. Un genswarms más: un cron le da tick a un objeto
-`:scope` que lee el dashboard backend de cada swarm observado y corre
-**detectores deterministas** (sin LLM); las alertas salen como cards de
-Telegram con evidencia, deep-link y prompt de investigación listo.
+The swarm that watches swarms. One more genswarms: a cron ticks a `:scope`
+object that reads each observed swarm's dashboard backend and runs
+**deterministic detectors** (no LLM); alerts go out as Telegram cards with
+evidence, a deep-link and a ready-made investigation prompt — and escalate
+as diagnosis tasks to an isolated agent.
 
 ```
 :cron ──tick──▶ :scope ──card──▶ :sender (genswarms-telegram)
-                  │
-                  └── lecturas para agentes (:diagnostico, fase 3)
+                  │  └──escalation──▶ :diagnostico (bwrap, isolated network)
+                  └── read actions for agents (status / get_dashboard / get_events)
 ```
 
-## Detectores (`Genswarms.Observer.Detectors`, puro)
+## Detectors (`Genswarms.Observer.Detectors`, pure)
 
-| tipo             | condición                                                        |
+| type             | condition                                                        |
 |------------------|------------------------------------------------------------------|
-| `endpoint_down`  | el fetch del dashboard falla                                     |
-| `stall`          | agentes activos pero sin eventos en `stall_minutes` (10)         |
-| `error_burst`    | ≥ `error_burst_count` (5) eventos error en `error_burst_window_s` (60) |
-| `budget_block`   | `llm_proxy_global_block` visto en eventos                        |
-| `pool_saturated` | `leased == size` sostenido `pool_saturated_s` (120)              |
+| `endpoint_down`  | the dashboard fetch fails                                        |
+| `stall`          | active agents but no events for `stall_minutes` (10)             |
+| `error_burst`    | ≥ `error_burst_count` (5) error events within `error_burst_window_s` (60) |
+| `budget_block`   | `llm_proxy_global_block` seen in events                          |
+| `pool_saturated` | `leased == size` sustained for `pool_saturated_s` (120)          |
 
-Dedupe + cooldown por `(swarm, tipo)` en `:scope` (`cooldown_minutes`, 30).
+Dedupe + cooldown per `(swarm, type)` in `:scope` (`cooldown_minutes`, 30).
 
-## Principios
+## Principles
 
-- Los detectores son funciones puras; el LLM solo diagnostica (fase 3).
-- Solo `:scope` abre sockets; los agentes le preguntan por la topología.
-- Tokens como **nombres** de env vars (`token_env`) — nunca literales.
-- `registry` y `thresholds` son `x-mutable` (hot-patch desde el
-  configurador); las allowlists (`tick_sources`, `read_sources`) NO.
+- Detectors are pure functions; the LLM only diagnoses (fase 3).
+- Only `:scope` opens sockets; agents ask it through the topology
+  (`:diagnostico` runs with `network: :isolated` — nothing but the LLM
+  router forwarder).
+- Tokens as env var **names** (`token_env`) — never literals.
+- `registry` and `thresholds` are `x-mutable` (hot-patch from the
+  configurator); allowlists (`tick_sources`, `read_sources`,
+  `escalate_to`) are NOT.
+- The model is never named: `:diagnostico` carries a Σ_pol routing policy
+  to the unhardcoded router; context sealing is the router's auto-compaction
+  (`compact_extra`).
 
-## Uso
+## Usage
 
-Ver `observer.swarm.exs` (cron + scope + sender + dashboard opcional) y
-`swarm-object.json` (config schema de `:scope`). En vivo:
+See `observer.swarm.exs` (cron + scope + sender + diagnostico + optional
+dashboard) and `swarm-object.json` (the `:scope` config schema). Live:
 
 ```bash
-GENSWARMS_PATH=/path/al/engine \
+GENSWARMS_PATH=/path/to/engine \
+SUBZEROCLAW_PATH=/path/to/subzeroclaw/subzeroclaw \
+GENSWARMS_ALLOWED_ENDPOINTS=router.ygr.ai \
+UNHARDCODED_CONSUMER_KEY=llmr_... \
 OBSERVER_TELEGRAM_BOT_TOKEN=... \
 OBSERVER_ALERT_CONVERSATION_ID=tg:...:0 \
 mix run run_live.exs
 ```
 
-Tests: `mix test` (detectores + scope + conformance schema↔init).
-Boot smoke sin red: `GENSWARMS_PATH=... mix run tests/boot_smoke.exs`.
+Tests: `mix test` (detectors + scope + schema↔init conformance).
+Network-less boot smoke: `GENSWARMS_PATH=... mix run tests/boot_smoke.exs`.
 
 ## Wire contract
 
-Los shapes del dashboard/events son el golden contract del backend de
-genswarms-dashboard (`backend/README.md`) — no inventar keys.
+Dashboard/events shapes are the genswarms-dashboard backend's golden
+contract (`backend/README.md`) — do not invent keys.

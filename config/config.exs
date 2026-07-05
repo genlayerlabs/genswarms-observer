@@ -1,9 +1,9 @@
 import Config
 
-# La config de una dep por path NO se carga en el host: cuando el engine entra
-# como dep (GENSWARMS_PATH, runs en vivo), su endpoint REST necesita adapter y
-# secret declarados AQUÍ o Phoenix cae al adapter cowboy (undef). Inerte si el
-# engine no está en el árbol.
+# A path dep's config files are NOT loaded by the host: when the engine comes
+# in as a dep (GENSWARMS_PATH, live runs), its REST endpoint needs the adapter
+# and secret declared HERE or Phoenix falls back to the cowboy adapter
+# (undef). Inert when the engine is not in the tree.
 config :genswarms, GenswarmsWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,

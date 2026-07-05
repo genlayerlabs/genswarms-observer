@@ -228,25 +228,25 @@ defmodule Genswarms.Observer.Objects.Scope do
     }
   end
 
-  # Fase 3: la misma alerta (ya deduplicada por cooldown) se escala como TAREA
-  # al agente de diagnóstico. El agente no tiene red hacia los swarms — el
-  # prompt le recuerda que pregunte a :scope por la topología.
+  # Fase 3: the same alert (already cooldown-deduped) escalates as a TASK to
+  # the diagnosis agent. The agent has no network towards the swarms — the
+  # prompt reminds it to ask :scope through the topology.
   defp escalate(%{escalate_to: nil}, _alert), do: :ok
 
   defp escalate(state, alert) do
     task = """
-    ALERTA del observer — diagnostica.
+    Observer ALERT — diagnose it.
     swarm: #{alert.swarm}
-    tipo: #{alert.type}
-    resumen: #{alert.summary}
-    evidencia: #{Jason.encode!(alert.evidence)}
+    type: #{alert.type}
+    summary: #{alert.summary}
+    evidence: #{Jason.encode!(alert.evidence)}
 
-    NO tienes red hacia los swarms. Pide los datos a `scope` con swarm-msg ask:
+    You have NO network towards the swarms. Ask `scope` for data via swarm-msg ask:
       {"action":"get_dashboard","swarm":"#{alert.swarm}"}
       {"action":"get_events","swarm":"#{alert.swarm}"}
       {"action":"status"}
-    Redacta un diagnóstico: síntoma, evidencia concreta, hipótesis y
-    siguiente paso accionable.
+    Write a diagnosis: symptom, concrete evidence, hypotheses and the next
+    actionable step.
     """
 
     case state.deliver_fn.(state.escalate_to, state.name, task) do
@@ -278,8 +278,8 @@ defmodule Genswarms.Observer.Objects.Scope do
         %{
           "kind" => "paragraph",
           "text" =>
-            "investigar: conecta el MCP genswarms-fleet y corre " <>
-              ~s{get_events("#{alert.swarm}", level: "error") y get_dashboard("#{alert.swarm}").}
+            "investigate: connect the genswarms-fleet MCP and run " <>
+              ~s{get_events("#{alert.swarm}", level: "error") and get_dashboard("#{alert.swarm}").}
         }
       ]
     }

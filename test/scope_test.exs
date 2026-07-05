@@ -209,7 +209,7 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Jason.decode!(delivery.content)["card"]["title"] =~ "endpoint_down"
   end
 
-  # ── escalada (fase 3) ─────────────────────────────────────────────────────
+  # ── escalation (fase 3) ───────────────────────────────────────────────────
 
   test "with escalate_to set, an emitted alert also becomes a diagnosis task" do
     %{state: state, outbox: outbox} =
@@ -226,7 +226,7 @@ defmodule Genswarms.Observer.ScopeTest do
     assert task.target == :diagnostico
     assert task.content =~ "endpoint_down"
     assert task.content =~ ~s({"action":"get_events","swarm":"wingston"})
-    assert task.content =~ "NO tienes red"
+    assert task.content =~ "NO network"
   end
 
   test "escalation respects the cooldown (a suppressed alert does not escalate)" do

@@ -1,6 +1,6 @@
-# Boot smoke: arranca el swarm observer con fakes (sin red, sin Telegram
-# real), fuerza un tick y verifica que la alerta endpoint_down llega al
-# sender como send_card.
+# Boot smoke: boots the observer swarm with fakes (no network, no real
+# Telegram), forces a tick and verifies the endpoint_down alert reaches the
+# sender as a send_card.
 #
 #   GENSWARMS_PATH=/home/jm/docs/personal/genswarms mix run tests/boot_smoke.exs
 
@@ -8,20 +8,20 @@
 
 root = Path.expand("..", __DIR__)
 
-# ── fakes, publicados donde observer.swarm.exs (OBSERVER_SMOKE=1) los lee ──
-# El scope fake NO conoce ningún swarm: todo fetch responde
-# {:error, :not_configured} — exactamente lo que endpoint_down debe ver.
+# ── fakes, published where observer.swarm.exs (OBSERVER_SMOKE=1) reads them ─
+# The scope fake knows NO swarm: every fetch answers
+# {:error, :not_configured} — exactly what endpoint_down must see.
 {:ok, scope_fake} = Genswarms.Observer.Client.Fake.start_link(%{})
 {:ok, telegram_fake} = Genswarms.Telegram.Client.Fake.start_link()
 :persistent_term.put({:observer_smoke, :scope_fake}, scope_fake)
 :persistent_term.put({:observer_smoke, :telegram_fake}, telegram_fake)
 
 System.put_env("OBSERVER_SMOKE", "1")
-# puerto propio: no chocar con un observer vivo en :4996
+# own port: don't collide with a live observer on :4996
 System.put_env("OBSERVER_DASHBOARD_PORT", "4997")
 System.put_env("OBSERVER_TELEGRAM_BOT_TOKEN", "0000000000:smoke-dummy")
 System.put_env("OBSERVER_ALERT_CONVERSATION_ID", "tg:1:0")
-# el seed job no debe disparar solo durante el smoke (29 de febrero)
+# the seed job must not fire on its own during the smoke (February 29th)
 System.put_env("OBSERVER_TICK_CRON", "0 0 29 2 *")
 
 Genswarms.SwarmManager.stop("observer")
@@ -32,7 +32,7 @@ Process.sleep(1_500)
 status = Genswarms.SwarmManager.status("observer")
 IO.puts("swarm status: #{inspect(status, limit: 6, printable_limit: 200)}")
 
-# ── tick forzado (como si fuera cron) → endpoint_down → card al sender ─────
+# ── forced tick (as if from cron) → endpoint_down → card to the sender ─────
 Genswarms.Objects.ObjectServer.deliver_message(
   "observer",
   :scope,
@@ -45,7 +45,7 @@ Process.sleep(1_000)
 calls = Genswarms.Telegram.Client.Fake.calls(telegram_fake)
 IO.puts("telegram fake recorded #{length(calls)} call(s)")
 
-# send_card viaja como :send_rich_message con el card renderizado a HTML
+# send_card travels as :send_rich_message with the card rendered to HTML
 sent_alert? =
   Enum.any?(calls, fn %{payload: payload} ->
     html = get_in(payload, [:rich_message, :html]) || payload[:text] || ""
