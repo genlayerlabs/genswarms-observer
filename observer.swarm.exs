@@ -70,11 +70,11 @@ diagnostico =
       config: %{
         network: :isolated,
         api_key: System.get_env("UNHARDCODED_CONSUMER_KEY"),
-        # parámetros de subzeroclaw: el diagnóstico es acotado por diseño.
-        # OJO: max_turns via config del backend mata el sandbox en este host
-        # (exit 1 al arrancar, A/B verificado) — pendiente issue al engine;
-        # el default de szc (200) acota igualmente el loop.
-        # max_turns: 24,
+        # Sin max_turns: el default de szc (200) ya acota el loop de tools
+        # por tarea, y el contexto lo gestiona la autocompactación del router
+        # (compact_extra) — un presupuesto arbitrario aquí solo puede truncar
+        # trabajo legítimo. (Si algún día hace falta, requiere engine ≥ #79:
+        # antes, CUALQUIER agente bwrap con max_turns moría al arrancar.)
         # sin "model": contra el router la Σ_pol decide; un model literal
         # aquí sería precisamente lo que unhardcoded existe para evitar
         request_extra: %{
