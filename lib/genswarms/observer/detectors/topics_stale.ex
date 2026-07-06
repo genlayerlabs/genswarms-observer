@@ -28,7 +28,7 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
   @impl true
   def detect(fetched, ctx) do
     periods_threshold = ctx.thresholds["topics_stale.periods"]
-    state = ctx.state || %{ever_seen: false}
+    state = normalize_state(ctx.state)
 
     case newest_final_period_id(fetched) do
       {:ok, period_id} ->
@@ -49,6 +49,12 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
         else
           {[], state}
         end
+
+      # F8: the dashboard did not fetch this tick — we have NO evidence about
+      # the extension either way. Mirrors the feed detectors' no-op discipline:
+      # a transient endpoint blip must not read as "extension missing".
+      :no_data ->
+        {[], state}
     end
   end
 
@@ -72,7 +78,14 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
     end
   end
 
-  defp newest_final_period_id(_), do: :absent_or_malformed
+  # No fetched dashboard at all ({:error, _}, missing key, malformed client
+  # return): no evidence, no verdict.
+  defp newest_final_period_id(_), do: :no_data
+
+  # F2 guard (same class as DeliveryFailureBurst.normalize_state/1): a
+  # poisoned store entry must restart clean, never crash the tick forever.
+  defp normalize_state(%{ever_seen: seen}) when is_boolean(seen), do: %{ever_seen: seen}
+  defp normalize_state(_), do: %{ever_seen: false}
 
   # ISO-8601 "YYYY-MM-DD" strings sort lexicographically in chronological
   # order, so a plain Enum.max/1 over the validated id strings is enough.

@@ -739,5 +739,48 @@ defmodule Genswarms.Observer.DetectorsUxTest do
     test "default_thresholds exposes only its namespaced key" do
       assert TopicsStale.default_thresholds() == %{"topics_stale.periods" => 1}
     end
+
+    # F8: dashboard fetch errors are not 'extension missing'
+    @tag regression: "F8"
+    test "dashboard {:error, _} after ever_seen is a no-op with prior state" do
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1},
+        state: %{ever_seen: true},
+        now_ms: 1_751_734_800_000
+      }
+
+      fetched = %{dashboard: {:error, {:client_crash, "timeout"}}, events: {:ok, []}}
+      assert {[], %{ever_seen: true}} =
+               Genswarms.Observer.Detectors.TopicsStale.detect(fetched, ctx)
+    end
+
+    @tag regression: "F8"
+    test "missing :dashboard key is a no-op, not a missing-extension alert" do
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1},
+        state: %{ever_seen: true},
+        now_ms: 1_751_734_800_000
+      }
+
+      assert {[], %{ever_seen: true}} =
+               Genswarms.Observer.Detectors.TopicsStale.detect(%{events: {:ok, []}}, ctx)
+    end
+
+    @tag regression: "F8"
+    test "a fetched envelope WITHOUT the extension still alerts after ever_seen" do
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1},
+        state: %{ever_seen: true},
+        now_ms: 1_751_734_800_000
+      }
+
+      fetched = %{dashboard: {:ok, %{"swarm" => "wingston"}}, events: {:ok, []}}
+      assert {[alert], _} = Genswarms.Observer.Detectors.TopicsStale.detect(fetched, ctx)
+      assert alert.type == :topics_stale
+      assert alert.evidence["reason"] == "extension_absent_or_malformed"
+    end
   end
 end
