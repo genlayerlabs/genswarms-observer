@@ -55,7 +55,7 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     case fetched do
       %{feed: {:ok, events}} when is_list(events) ->
         minutes = ctx.thresholds["unanswered.minutes"]
-        tracked = apply_events(sort_by_ts(events), ctx.state || %{})
+        tracked = apply_events(sort_by_ts(events), normalize_state(ctx.state))
 
         {alerts, new_state} = scan(tracked, ctx.swarm, minutes, ctx.now_ms)
 
@@ -85,6 +85,21 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     |> Enum.filter(&event_ms/1)
     |> Enum.sort_by(&event_ms/1)
   end
+
+  # F2 guard: state is a map of cid => %{opened_ms:, alerted:}; a poisoned
+  # store entry (any other shape, or entries with the wrong inner shape)
+  # restarts clean rather than crash-looping the tick forever.
+  defp normalize_state(state) when is_map(state) do
+    Map.filter(state, fn
+      {cid, %{opened_ms: ms, alerted: a}} when is_binary(cid) and is_integer(ms) and is_boolean(a) ->
+        true
+
+      _ ->
+        false
+    end)
+  end
+
+  defp normalize_state(_), do: %{}
 
   defp prune_stale_alerted(tracked, now_ms) do
     tracked

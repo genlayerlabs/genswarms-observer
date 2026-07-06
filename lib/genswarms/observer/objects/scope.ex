@@ -70,6 +70,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   @alerts_kept 50
   @alert_budget_per_swarm 6
   @period_re ~r/^\d{4}-\d{2}-\d{2}$/
+  @quarantine_after 3
 
   # O6: cid-bound diagnosis relay. The eligible-type set is a literal list,
   # not derived from the loaded modules — deriving it would mean executing
@@ -197,7 +198,14 @@ defmodule Genswarms.Observer.Objects.Scope do
       # runs — a stage that didn't run this tick keeps its previous entry.
       # Session-local bookkeeping, deliberately NOT persisted (health is a
       # statement about THIS process's pipeline, not durable history).
-      health: %{}
+      health: %{},
+      # F2: `{swarm, module} => consecutive failed ticks`. At
+      # @quarantine_after the module stops running for that swarm, its
+      # per-swarm det state is DROPPED (a poisoned entry can never heal by
+      # replaying), and one :detector_quarantined alert goes through the
+      # normal pipeline. Session-local by design: an observer restart is
+      # the operator's reset lever.
+      quarantine: %{}
     }
 
     {:ok, load_store(state, now_fn.())}
@@ -493,9 +501,10 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         st = %{st | det: Map.put(st.det, swarm, swarm_det_states)}
         st = record_detector_health(st, swarm, det_health, now)
+        {st, quarantine_alerts} = update_quarantine(st, swarm, det_health, now)
 
         {passed, supp} =
-          Enum.reduce(alerts, {[], supp}, fn alert, {passed, supp} ->
+          Enum.reduce(quarantine_alerts ++ alerts, {[], supp}, fn alert, {passed, supp} ->
             if cooled_down?(st, alert, now) do
               {[alert | passed], supp}
             else
@@ -765,6 +774,47 @@ defmodule Genswarms.Observer.Objects.Scope do
           {:error, "failing: " <> Enum.join(mods, ", ")}
         )
     end
+  end
+
+  # F2: success resets the streak; failure increments it. Crossing the
+  # threshold drops the module's (possibly poisoned) state and emits one
+  # synthetic alert through the NORMAL pipeline (cooldown/budget apply).
+  defp update_quarantine(state, swarm, det_health, now) do
+    Enum.reduce(det_health, {state, []}, fn %{module: mod, ok: ok}, {st, alerts} ->
+      key = {swarm, mod}
+
+      cond do
+        ok ->
+          {%{st | quarantine: Map.delete(st.quarantine, key)}, alerts}
+
+        Map.get(st.quarantine, key, 0) + 1 == @quarantine_after ->
+          st = %{
+            st
+            | quarantine: Map.put(st.quarantine, key, @quarantine_after),
+              det: Map.update(st.det, swarm, %{}, &Map.delete(&1, mod))
+          }
+
+          {st, [quarantine_alert(swarm, mod, now) | alerts]}
+
+        true ->
+          {%{st | quarantine: Map.update(st.quarantine, key, 1, &(&1 + 1))}, alerts}
+      end
+    end)
+  end
+
+  defp quarantine_alert(swarm, mod, now) do
+    %{
+      type: :detector_quarantined,
+      swarm: swarm,
+      at_ms: now,
+      summary:
+        "detector #{inspect(mod)} failed #{@quarantine_after} consecutive ticks — " <>
+          "disabled for #{swarm}, state dropped; restart the observer to re-enable",
+      evidence: %{"module" => inspect(mod), "consecutive_failures" => @quarantine_after},
+      key: {swarm, :detector_quarantined, mod},
+      cids: [],
+      source: __MODULE__
+    }
   end
 
   # :digest — cards planned vs delivered. Zero planned cards is a healthy
@@ -1175,7 +1225,9 @@ defmodule Genswarms.Observer.Objects.Scope do
       |> Enum.filter(&custom_detector_scoped?(&1, swarm))
       |> Enum.map(& &1.module)
 
-    state.detectors ++ customs
+    Enum.reject(state.detectors ++ customs, fn mod ->
+      Map.get(state.quarantine, {swarm, mod}, 0) >= @quarantine_after
+    end)
   end
 
   defp custom_detector_scoped?(%{swarms: nil}, _swarm), do: true

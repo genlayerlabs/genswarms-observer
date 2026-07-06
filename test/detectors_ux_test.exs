@@ -417,6 +417,27 @@ defmodule Genswarms.Observer.DetectorsUxTest do
     end
   end
 
+  describe "Unanswered — F2 guard: poisoned persisted state restarts clean" do
+    @tag regression: "F2"
+    test "a non-map ctx.state does not crash detect/2" do
+      events = [%{"kind" => "request_open", "cid" => "tg:1:0", "seq" => 1, "ts" => 1.0}]
+
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: :poisoned_garbage,
+        now_ms: 120_000
+      }
+
+      # 2 minutes elapsed: no alert yet, but the open must be tracked in a MAP.
+      assert {[], state} =
+               Genswarms.Observer.Detectors.Unanswered.detect(%{feed: {:ok, events}}, ctx)
+
+      assert is_map(state)
+      assert Map.has_key?(state, "tg:1:0")
+    end
+  end
+
   # ── DeliveryFailureBurst ─────────────────────────────────────────────────────
 
   describe "DeliveryFailureBurst" do
@@ -920,6 +941,44 @@ defmodule Genswarms.Observer.DetectorsUxTest do
                Genswarms.Observer.Detectors.TopicsStale.detect(topics_fetched("2026-07-04"), ctx)
 
       assert alert.type == :topics_stale
+    end
+  end
+
+  # ── TopicsStale — F2 guard: poisoned persisted state restarts clean ─────────
+  #
+  # Task 1 added `normalize_state/1` to topics_stale.ex but nothing exercised
+  # its fallback branch: a map missing `:ever_seen` (would KeyError on
+  # `state.ever_seen` pre-guard) and a non-map entirely. Both must restart
+  # clean (`%{ever_seen: false}`) rather than crash the tick.
+  describe "TopicsStale — F2 guard: poisoned persisted state restarts clean" do
+    @tag regression: "F2"
+    test "ctx.state missing :ever_seen does not crash detect/2" do
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1, "topics_stale.grace_hours" => 1},
+        state: %{},
+        now_ms: 1_751_734_800_000
+      }
+
+      fetched = %{dashboard: {:ok, %{"swarm" => "wingston"}}, events: {:ok, []}}
+
+      assert {[], %{ever_seen: false}} =
+               Genswarms.Observer.Detectors.TopicsStale.detect(fetched, ctx)
+    end
+
+    @tag regression: "F2"
+    test "a non-map ctx.state does not crash detect/2" do
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1, "topics_stale.grace_hours" => 1},
+        state: :garbage,
+        now_ms: 1_751_734_800_000
+      }
+
+      fetched = %{dashboard: {:ok, %{"swarm" => "wingston"}}, events: {:ok, []}}
+
+      assert {[], %{ever_seen: false}} =
+               Genswarms.Observer.Detectors.TopicsStale.detect(fetched, ctx)
     end
   end
 end

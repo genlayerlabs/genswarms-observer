@@ -1051,4 +1051,49 @@ defmodule Genswarms.Observer.ScopeTest do
     assert [%{data: %{health: post}}] = Scope.dashboard(state)
     assert post == %{"wingston" => %{ok: true, failing: []}}
   end
+
+  # ── F2: detector quarantine ───────────────────────────────────────────────
+
+  defmodule AlwaysCrashDetector do
+    @behaviour Genswarms.Observer.Detector
+    def detect(_fetched, _ctx), do: raise("boom")
+  end
+
+  describe "F2: detector quarantine" do
+    @tag regression: "F2"
+    test "3 consecutive crashes quarantine the module, clear its state, and alert once" do
+      %{state: state, clock: clock, outbox: outbox} =
+        start_scope(config: %{custom_detectors: [AlwaysCrashDetector], cooldown_minutes: 0})
+
+      # Ticks 1-3: detector_crashed each tick; tick 3 transitions to quarantined.
+      state =
+        Enum.reduce(1..3, state, fn _, st ->
+          advance(clock, 60_000)
+          {_, st} = decode_reply(tick(st))
+          st
+        end)
+
+      assert state.quarantine[{"wingston", AlwaysCrashDetector}] == 3
+      refute Map.has_key?(Map.get(state.det, "wingston", %{}), AlwaysCrashDetector)
+
+      quarantine_cards =
+        sent(outbox)
+        |> Enum.filter(&String.contains?(&1.content, "detector_quarantined"))
+
+      assert length(quarantine_cards) == 1
+
+      # Tick 4: the module no longer runs — no NEW detector_crashed card.
+      crashed_before =
+        sent(outbox) |> Enum.count(&String.contains?(&1.content, "detector_crashed"))
+
+      advance(clock, 60_000)
+      {_, state} = decode_reply(tick(state))
+
+      crashed_after =
+        sent(outbox) |> Enum.count(&String.contains?(&1.content, "detector_crashed"))
+
+      assert crashed_after == crashed_before
+      assert state.quarantine[{"wingston", AlwaysCrashDetector}] == 3
+    end
+  end
 end
