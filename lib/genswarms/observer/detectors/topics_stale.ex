@@ -20,7 +20,7 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
   @behaviour Genswarms.Observer.Detector
 
   @impl true
-  def default_thresholds, do: %{"topics_stale.periods" => 1}
+  def default_thresholds, do: %{"topics_stale.periods" => 1, "topics_stale.grace_hours" => 1}
 
   @impl true
   def init, do: %{ever_seen: false}
@@ -34,7 +34,7 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
       {:ok, period_id} ->
         new_state = %{ever_seen: true}
 
-        if stale?(period_id, ctx.now_ms, periods_threshold) do
+        if stale?(period_id, ctx.now_ms, ctx.thresholds) do
           {[stale_alert(ctx.swarm, ctx.now_ms, period_id, periods_threshold)], new_state}
         else
           {[], new_state}
@@ -104,9 +104,19 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
     match?({:ok, _}, Date.from_iso8601(id))
   end
 
-  defp stale?(period_id, now_ms, periods_threshold) do
+  # F3: the cutoff date is derived from (now - grace_hours), not raw now.
+  # The producer's promise is "yesterday's period closes shortly AFTER
+  # midnight" (wingston: 00:15 UTC cron) — evaluating against the raw UTC
+  # date in that gap would false-alarm nightly. Promise-vs-observation:
+  # never evaluate a schedule the producer hasn't had time to keep.
+  defp stale?(period_id, now_ms, thresholds) do
+    periods_threshold = thresholds["topics_stale.periods"]
+    grace_ms = round(Map.get(thresholds, "topics_stale.grace_hours", 1) * 3_600_000)
     {:ok, newest_date} = Date.from_iso8601(period_id)
-    today = now_ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_date()
+
+    today =
+      (now_ms - grace_ms) |> DateTime.from_unix!(:millisecond) |> DateTime.to_date()
+
     cutoff = Date.add(today, -periods_threshold)
     Date.compare(newest_date, cutoff) == :lt
   end

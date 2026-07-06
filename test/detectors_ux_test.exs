@@ -736,8 +736,8 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       assert {[], %{ever_seen: false}} = TopicsStale.detect(f, ctx)
     end
 
-    test "default_thresholds exposes only its namespaced key" do
-      assert TopicsStale.default_thresholds() == %{"topics_stale.periods" => 1}
+    test "default_thresholds exposes only its namespaced keys" do
+      assert TopicsStale.default_thresholds() == %{"topics_stale.periods" => 1, "topics_stale.grace_hours" => 1}
     end
 
     # F8: dashboard fetch errors are not 'extension missing'
@@ -781,6 +781,61 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       assert {[alert], _} = Genswarms.Observer.Detectors.TopicsStale.detect(fetched, ctx)
       assert alert.type == :topics_stale
       assert alert.evidence["reason"] == "extension_absent_or_malformed"
+    end
+  end
+
+  # ── TopicsStale — F3: midnight grace window ──────────────────────────────────
+
+  describe "TopicsStale — F3: midnight grace window" do
+    # 2026-07-06 00:05:00 UTC in ms (corrected from brief: brief had 1_782_950_700_000 which is 2026-07-02)
+    @just_after_midnight 1_783_296_300_000
+
+    defp topics_fetched(period_id) do
+      %{
+        dashboard:
+          {:ok,
+           %{
+             "extensions" => %{
+               "conversation_topics" => %{
+                 "periods" => [%{"period_id" => period_id, "final" => true}]
+               }
+             }
+           }},
+        events: {:ok, []}
+      }
+    end
+
+    @tag regression: "F3"
+    test "at 00:05 UTC, newest final = D-2 does NOT alert (producer closes D-1 at 00:15)" do
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1, "topics_stale.grace_hours" => 1},
+        state: %{ever_seen: true},
+        now_ms: @just_after_midnight
+      }
+
+      # now = 2026-07-06 00:05Z; newest final period = 2026-07-04 (D-2).
+      # Without grace: today=07-06, cutoff=07-05, 07-04 < 07-05 → false alarm.
+      # With 1h grace: effective today=07-05, cutoff=07-04 → healthy.
+      assert {[], _} =
+               Genswarms.Observer.Detectors.TopicsStale.detect(topics_fetched("2026-07-04"), ctx)
+    end
+
+    @tag regression: "F3"
+    test "at 02:00 UTC, newest final = D-2 DOES alert (grace expired, close missed)" do
+      two_am = @just_after_midnight + 115 * 60_000
+
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"topics_stale.periods" => 1, "topics_stale.grace_hours" => 1},
+        state: %{ever_seen: true},
+        now_ms: two_am
+      }
+
+      assert {[alert], _} =
+               Genswarms.Observer.Detectors.TopicsStale.detect(topics_fetched("2026-07-04"), ctx)
+
+      assert alert.type == :topics_stale
     end
   end
 end
