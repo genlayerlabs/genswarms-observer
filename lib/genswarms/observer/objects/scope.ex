@@ -669,7 +669,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     seen = Map.get(state.seen_periods, swarm, MapSet.new())
     {cards, newly_seen} = Digest.plan(swarm, envelope, seen)
 
-    results = Enum.map(cards, &deliver_digest_card(state, &1))
+    results = Enum.map(cards, &send_card(state, &1))
     delivered = Enum.count(results, &(&1 == :ok))
 
     state =
@@ -687,7 +687,11 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   defp deliver_digest(state, _swarm, _data, _now), do: state
 
-  defp deliver_digest_card(state, card) do
+  # The one card-to-:sender path, shared by alert cards (`emit_alert/4`)
+  # and digest cards (`deliver_digest/4`): build the send_card payload,
+  # deliver, log any non-:ok outcome and hand it back for the caller's
+  # health bookkeeping.
+  defp send_card(state, card) do
     payload =
       Jason.encode!(%{
         "action" => "send_card",
@@ -701,7 +705,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
       other ->
         Logger.warning(
-          "[observer] digest delivery to #{inspect(state.sender)} returned #{inspect(other)}"
+          "[observer] card delivery to #{inspect(state.sender)} returned #{inspect(other)}"
         )
 
         other
@@ -853,27 +857,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   defp emit_alert(state, alert, entry, now) do
-    card = alert_card(alert, entry)
-
-    payload =
-      Jason.encode!(%{
-        "action" => "send_card",
-        "conversation_id" => state.alert_conversation_id,
-        "card" => card
-      })
-
-    result =
-      case state.deliver_fn.(state.sender, state.name, payload) do
-        :ok ->
-          :ok
-
-        other ->
-          Logger.warning(
-            "[observer] alert delivery to #{inspect(state.sender)} returned #{inspect(other)}"
-          )
-
-          other
-      end
+    result = send_card(state, alert_card(alert, entry))
 
     escalate(state, alert)
 

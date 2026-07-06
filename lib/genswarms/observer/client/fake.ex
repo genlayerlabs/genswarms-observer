@@ -79,30 +79,25 @@ defmodule Genswarms.Observer.Client.Fake do
   end
 
   @impl true
-  def get_session_history(_base_url, swarm, cid, token, opts) do
+  def get_session_history(_base_url, swarm, cid, token, opts),
+    do: answer(swarm, :session_history, token, opts, cid)
+
+  # `cid` deepens both the fixture path and the recorded call — only
+  # `get_session_history` passes one; the plain readers leave it nil.
+  defp answer(swarm, kind, token, opts, cid \\ nil) do
     pid = Keyword.fetch!(opts, :fake)
 
     Agent.get_and_update(pid, fn state ->
-      call = %{swarm: swarm, kind: :session_history, cid: cid, token: token}
-
-      reply =
-        case get_in(state.fixture, [swarm, :session_history, cid]) do
-          nil -> {:error, :not_configured}
-          result -> result
+      call =
+        case cid do
+          nil -> %{swarm: swarm, kind: kind, token: token}
+          cid -> %{swarm: swarm, kind: kind, cid: cid, token: token}
         end
 
-      {reply, %{state | calls: [call | state.calls]}}
-    end)
-  end
-
-  defp answer(swarm, kind, token, opts) do
-    pid = Keyword.fetch!(opts, :fake)
-
-    Agent.get_and_update(pid, fn state ->
-      call = %{swarm: swarm, kind: kind, token: token}
+      path = if cid == nil, do: [swarm, kind], else: [swarm, kind, cid]
 
       reply =
-        case get_in(state.fixture, [swarm, kind]) do
+        case get_in(state.fixture, path) do
           nil -> {:error, :not_configured}
           result -> result
         end
