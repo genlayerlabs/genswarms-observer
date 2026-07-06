@@ -258,6 +258,38 @@ defmodule Genswarms.Observer.RelayTest do
     assert Jason.decode!(json_b)["ok"] == true
   end
 
+  test "relay budget resets when its alert ages out of state.alerts — a fresh same-key alert starts clean" do
+    key = {"wingston", :unanswered, "tg:1:0"}
+
+    %{state: state} =
+      start_scope(
+        fixture: %{
+          "wingston" => %{
+            dashboard: {:error, :down},
+            session_history: %{"tg:1:0" => {:ok, %{"turns" => []}}}
+          }
+        },
+        config: %{deliver_fn: fn _target, _from, _content -> :ok end}
+      )
+
+    # a previous alert instance exhausted its 3-relay budget and has since
+    # scrolled out of state.alerts (the Enum.take trim) — only the stale
+    # count remains
+    state = %{state | relay_counts: %{key => 3}, alerts: []}
+
+    # any tick that emits an alert (here: endpoint_down from the dead
+    # dashboard) trims state.alerts and must prune counts whose alert is
+    # no longer live
+    {:reply, _json, state} = Scope.handle_message(:cron, ~s({"action":"tick"}), state)
+    refute Map.has_key?(state.relay_counts, key)
+
+    # the same key re-alerts (fresh instance) — its budget starts at 0,
+    # so the relay is allowed again
+    state = %{state | alerts: [alert(%{}) | state.alerts]}
+    {:reply, json, _state} = ask(state, "wingston", "tg:1:0")
+    assert Jason.decode!(json)["ok"] == true
+  end
+
   # ── trust gate ─────────────────────────────────────────────────────────────
 
   test "untrusted from is dropped silently — never reaches the relay logic" do

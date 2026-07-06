@@ -176,12 +176,13 @@ defmodule Genswarms.Observer.Objects.Scope do
       last_tick_ms: nil,
       alerts: [],
       # O6: diagnosis relay bookkeeping. `relay_counts` is keyed by the
-      # SAME alert `key` used for cooldown — bounded in practice by the
-      # (small) `alerts` list, so it is never pruned on its own; a stale
-      # entry for an alert that has since scrolled out of `alerts` is inert
-      # (it can never be looked up again, since lookup goes through
-      # `alerts` first). `relay_log` is metadata-only, never transcript
-      # content — see `log_relay/6`.
+      # SAME alert `key` used for cooldown, and pruned at every emit
+      # (`emit_alert/4`, right where `alerts` is trimmed) down to the keys
+      # still present in `alerts` — the budget is tied to the live alert
+      # window, so a fresh same-key alert after the old one aged out
+      # starts from a clean count instead of inheriting an exhausted one.
+      # `relay_log` is metadata-only, never transcript content — see
+      # `log_relay/6`.
       relay_counts: %{},
       relay_log: [],
       # O7: per-stage pipeline self-observability, per observed swarm:
@@ -870,10 +871,19 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     state = record_sender_result(state, alert.swarm, result, now)
 
+    alerts = Enum.take([alert | state.alerts], @alerts_kept)
+
     %{
       state
       | last_alert: Map.put(state.last_alert, alert_key(alert), alert.at_ms),
-        alerts: Enum.take([alert | state.alerts], @alerts_kept)
+        alerts: alerts,
+        # Relay budgets live only as long as their alert: prune counts down
+        # to the keys still present in the (just-trimmed) alerts list. A
+        # key whose alert scrolled out here starts from a clean count when
+        # a fresh same-key alert emits later — a conversation that
+        # legitimately re-alerts is never starved by an exhausted budget
+        # inherited from a long-gone alert instance.
+        relay_counts: Map.take(state.relay_counts, Enum.map(alerts, &alert_key/1))
     }
   end
 
