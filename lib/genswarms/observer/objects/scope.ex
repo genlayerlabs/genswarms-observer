@@ -78,6 +78,13 @@ defmodule Genswarms.Observer.Objects.Scope do
   # (`:alerts_coalesced`, `:detector_crashed`, `:detector_invalid`,
   # `:store_rollback`) — only the classic health detectors plus the two
   # cid-carrying delivery detectors.
+  #
+  # O6 fix wave: this type allowlist is defense-in-depth only, kept for
+  # belt-and-suspenders — it is NOT what makes the gate trustworthy, because
+  # a custom detector can simply return one of these type atoms unprefixed.
+  # The load-bearing check is `@builtin_detector_modules` below, matched
+  # against `alert.source` (the detector module `DetectorRunner` actually
+  # ran, stamped onto the alert by the runner itself).
   @builtin_relay_types MapSet.new([
                          :unanswered,
                          :delivery_failure_burst,
@@ -97,6 +104,15 @@ defmodule Genswarms.Observer.Objects.Scope do
     Genswarms.Observer.Detectors.DeliveryFailureBurst,
     Genswarms.Observer.Detectors.TopicsStale
   ]
+
+  # O6 fix wave: the LOAD-BEARING relay gate. `@builtin_relay_types` alone is
+  # just a type-atom allowlist — a custom detector can return an unprefixed
+  # `:unanswered`/`:stall`/etc alert and forge eligibility. `DetectorRunner`
+  # stamps every alert with `source: mod` (the module that produced it,
+  # never taken from the detector's own return value — see
+  # `DetectorRunner.normalize/3`), so provenance is checked against the
+  # module that actually ran, not a self-reported type name.
+  @builtin_detector_modules MapSet.new(@builtin_detectors)
 
   # ── init ──────────────────────────────────────────────────────────────────
 
@@ -767,6 +783,8 @@ defmodule Genswarms.Observer.Objects.Scope do
     Enum.find(state.alerts, fn alert ->
       to_string(alert.swarm) == swarm and
         MapSet.member?(@builtin_relay_types, alert.type) and
+        MapSet.member?(@builtin_detector_modules, Map.get(alert, :source)) and
+        alert.at_ms <= now and
         now - alert.at_ms <= @relay_window_ms and
         cid in Map.get(alert, :cids, [])
     end)

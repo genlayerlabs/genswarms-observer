@@ -49,7 +49,8 @@ defmodule Genswarms.Observer.RelayTest do
         at_ms: @t0,
         summary: "request tg:1:0 unanswered for 20 min",
         evidence: %{},
-        cids: ["tg:1:0"]
+        cids: ["tg:1:0"],
+        source: Genswarms.Observer.Detectors
       },
       overrides
     )
@@ -149,6 +150,35 @@ defmodule Genswarms.Observer.RelayTest do
   test "denied: :alerts_coalesced synthetic alert never eligible even if it names the cid" do
     %{state: state} = start_scope()
     state = %{state | alerts: [alert(%{type: :alerts_coalesced, key: {"wingston", :alerts_coalesced}})]}
+
+    {:reply, json, _state} = ask(state, "wingston", "tg:1:0")
+    reply = Jason.decode!(json)
+
+    assert reply["ok"] == false
+    assert reply["error"] =~ "no fresh built-in alert"
+  end
+
+  test "denied: a custom detector forging a built-in type name (provenance gate)" do
+    # A package-namespaced custom detector could still return an unprefixed
+    # `:unanswered` alert — the type allowlist alone would let this through.
+    # The load-bearing check is `source`: this alert's source module isn't
+    # in the builtin set, so it must be denied even though the type and cid
+    # both look legitimate.
+    %{state: state} = start_scope()
+    state = %{state | alerts: [alert(%{source: MyCustomPackage.Detector})]}
+
+    {:reply, json, _state} = ask(state, "wingston", "tg:1:0")
+    reply = Jason.decode!(json)
+
+    assert reply["ok"] == false
+    assert reply["error"] =~ "no fresh built-in alert"
+  end
+
+  test "denied: built-in alert with a future at_ms (freshness gate rejects clock-skew forgery)" do
+    # A future timestamp would keep `now - at_ms <= window` true forever —
+    # freshness must also require the alert isn't from the future.
+    %{state: state} = start_scope()
+    state = %{state | alerts: [alert(%{at_ms: @t0 + @hour_ms})]}
 
     {:reply, json, _state} = ask(state, "wingston", "tg:1:0")
     reply = Jason.decode!(json)

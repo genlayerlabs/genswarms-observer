@@ -11,7 +11,11 @@ defmodule Genswarms.Observer.DetectorRunner do
     `detector_invalid` alert.
   - State only ever commits on a valid, successful return.
   - Every alert is normalized before being handed back: `key` defaults to
-    `{swarm, type}`, `cids` defaults to `[]`.
+    `{swarm, type}`, `cids` defaults to `[]`, and `source` is stamped with
+    the detector module that produced it — this is the provenance tag the
+    caller (scope.ex) uses to decide builtin-vs-custom trust; it is set by
+    the runner itself and is never taken from the detector's own return
+    value, so a detector cannot forge it.
 
   `states` and the returned states map are keyed by detector module.
   """
@@ -38,7 +42,7 @@ defmodule Genswarms.Observer.DetectorRunner do
       case run_one(mod, fetched, ctx, timeout_ms) do
         {:ok, raw, new_state} when is_list(raw) ->
           {valid, invalid} = Enum.split_with(raw, &valid_alert?/1)
-          normalized = Enum.map(valid, &normalize(&1, swarm))
+          normalized = Enum.map(valid, &normalize(&1, swarm, mod))
 
           if invalid == [] do
             {alerts ++ normalized, Map.put(sts, mod, new_state),
@@ -98,10 +102,11 @@ defmodule Genswarms.Observer.DetectorRunner do
 
   defp valid_alert?(_), do: false
 
-  defp normalize(alert, swarm) do
+  defp normalize(alert, swarm, mod) do
     alert
     |> Map.put_new(:key, {swarm, alert.type})
     |> Map.put_new(:cids, [])
+    |> Map.put(:source, mod)
   end
 
   defp synthetic(type, mod, swarm, now_ms, reason) do
@@ -112,7 +117,8 @@ defmodule Genswarms.Observer.DetectorRunner do
       summary: "detector #{inspect(mod)} #{describe(type)}",
       evidence: %{"module" => inspect(mod), "reason" => inspect(reason)},
       key: {swarm, type},
-      cids: []
+      cids: [],
+      source: mod
     }
   end
 
