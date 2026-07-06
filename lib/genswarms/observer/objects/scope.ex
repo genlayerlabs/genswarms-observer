@@ -485,11 +485,6 @@ defmodule Genswarms.Observer.Objects.Scope do
         {data, proposed_cursor, st} = fetch(swarm, entry, st)
 
         st =
-          if is_integer(proposed_cursor),
-            do: %{st | feed_cursors: Map.put(st.feed_cursors, swarm, proposed_cursor)},
-            else: st
-
-        st =
           st
           |> record_fetch_health(swarm, data, now)
           |> record_decode_health(swarm, data, now)
@@ -502,6 +497,22 @@ defmodule Genswarms.Observer.Objects.Scope do
         st = %{st | det: Map.put(st.det, swarm, swarm_det_states)}
         st = record_detector_health(st, swarm, det_health, now)
         {st, quarantine_alerts} = update_quarantine(st, swarm, det_health, now)
+
+        # F1: the cursor is the read-side commit point and the detector
+        # states are the compute-side commit point — they must move
+        # TOGETHER. A tick where any ACTIVE detector failed keeps the old
+        # cursor: the window replays next tick into detectors that are
+        # replay-safe by contract (put_new opens, seq-keyed dedupe), while
+        # the failed detector gets another shot at the same evidence.
+        # Quarantined modules are not active (detectors_for excludes them),
+        # so a permanently broken detector stops holding reads hostage
+        # after @quarantine_after ticks.
+        st =
+          if is_integer(proposed_cursor) and Enum.all?(det_health, & &1.ok) do
+            %{st | feed_cursors: Map.put(st.feed_cursors, swarm, proposed_cursor)}
+          else
+            st
+          end
 
         {passed, supp} =
           Enum.reduce(quarantine_alerts ++ alerts, {[], supp}, fn alert, {passed, supp} ->

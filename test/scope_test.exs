@@ -1096,4 +1096,64 @@ defmodule Genswarms.Observer.ScopeTest do
       assert state.quarantine[{"wingston", AlwaysCrashDetector}] == 3
     end
   end
+
+  # ── F1: cursor commit is gated on every active detector succeeding ────────
+
+  defmodule CrashOnceDetector do
+    @behaviour Genswarms.Observer.Detector
+    # Crashes only on its first run per BEAM (an Agent scoped to the test
+    # process would not survive the runner's Task); a named Agent keyed by
+    # the test pid keeps async tests isolated.
+    def start_flag(name), do: Agent.start_link(fn -> :crash end, name: name)
+
+    def detect(_fetched, ctx) do
+      flag = ctx.thresholds["crash_once.flag_name"] |> String.to_existing_atom()
+
+      case Agent.get_and_update(flag, fn v -> {v, :ok} end) do
+        :crash -> raise "first-run crash"
+        :ok -> {[], ctx.state}
+      end
+    end
+
+    def default_thresholds, do: %{"crash_once.flag_name" => "unset"}
+  end
+
+  describe "F1: cursor only commits when every active detector succeeded" do
+    @tag regression: "F1"
+    test "a tick with a crashed detector re-reads the same feed window next tick" do
+      flag = :"crash_once_#{System.unique_integer([:positive])}"
+      {:ok, _} = CrashOnceDetector.start_flag(flag)
+
+      # Feed: one request_open, opened long enough ago to be overdue.
+      open = feed_event("request_open", "tg:9:0", @t0 - 20 * 60_000)
+
+      %{state: state, fake: _fake, clock: clock, outbox: outbox} =
+        start_scope(
+          fixture: %{
+            "wingston" =>
+              Map.put(healthy_fixture(), :events_feed, {:ok, %{events: [open], seq: 1}})
+          },
+          config: %{
+            custom_detectors: [CrashOnceDetector],
+            thresholds: %{"crash_once.flag_name" => to_string(flag)}
+          }
+        )
+
+      # Tick 1: CrashOnceDetector crashes → cursor must NOT commit.
+      {_, state} = decode_reply(tick(state))
+      assert state.feed_cursors == %{}
+
+      # Tick 2: detector healthy now; the SAME window replays, Unanswered
+      # sees the overdue open and fires — the request was not lost.
+      advance(clock, 60_000)
+      {_, state} = decode_reply(tick(state))
+
+      assert state.feed_cursors["wingston"] == 1
+
+      unanswered =
+        sent(outbox) |> Enum.filter(&String.contains?(&1.content, "unanswered"))
+
+      assert length(unanswered) == 1
+    end
+  end
 end
