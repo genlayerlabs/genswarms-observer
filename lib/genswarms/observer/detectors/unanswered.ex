@@ -73,9 +73,18 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
   # seq > since, oldest first"), so the fold below is order-correct BY
   # CONTRACT. This sort is cheap insurance against a non-compliant host:
   # folding a reply BEFORE its open would delete a not-yet-tracked cid and
-  # then false-alert the answered pair. Malformed-ts events sort first and
-  # are skipped by the fold anyway.
-  defp sort_by_ts(events), do: Enum.sort_by(events, &(event_ms(&1) || 0))
+  # then false-alert the answered pair. Malformed-ts events are DROPPED
+  # here, not coerced (`|| 0` would sort them before every valid event,
+  # defeating the very order this insures): an event without a numeric ts
+  # cannot participate in time-based tracking at all — it neither opens a
+  # cid (the fold already skipped that) nor clears one (an untimed "ok
+  # reply" from a corrupt host is as suspect as its missing ts; both real
+  # wires stamp "ts" unconditionally, so only a malformed host is affected).
+  defp sort_by_ts(events) do
+    events
+    |> Enum.filter(&event_ms/1)
+    |> Enum.sort_by(&event_ms/1)
+  end
 
   defp prune_stale_alerted(tracked, now_ms) do
     tracked

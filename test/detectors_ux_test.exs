@@ -273,6 +273,53 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       assert state["tg:1:0"].opened_ms == 0
     end
 
+    test "malformed-ts events are fully inert: dropped before the sort, never coerced to ts 0" do
+      # The old `|| 0` coercion sorted a malformed-ts event BEFORE every
+      # valid one, defeating the defensive order the sort insures. Untimed
+      # events cannot participate in time-based tracking at all — including
+      # an ok reply_sent with a junk ts, which previously still cleared its
+      # cid whenever the stable sort happened to keep it after the open.
+      # Only well-formed events mutate tracking (both real wires always
+      # stamp a numeric "ts"; only a malformed host ever hits this).
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          %{"kind" => "reply_sent", "cid" => "tg:1:0", "ok" => true, "seq" => 2}
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      {alerts, _state} = Unanswered.detect(f, ctx0)
+
+      assert [%{type: :unanswered, cids: ["tg:1:0"]}] = alerts
+    end
+
+    test "a junk-ts event among a shuffled valid pair does not defeat the defensive order" do
+      # reply listed before its open (non-compliant host order) plus a
+      # malformed-ts stray: the sort must still fold open-then-reply, and
+      # the stray must not displace either.
+      f =
+        fetched([
+          ev("reply_sent", "tg:1:0", 60_000, %{"ok" => true}),
+          %{"kind" => "reply_sent", "cid" => "tg:9:9", "ok" => true, "seq" => 3, "ts" => "junk"},
+          ev("request_open", "tg:1:0", 0)
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], %{}} = Unanswered.detect(f, ctx0)
+    end
+
     test "micromarkets-shaped events (full log-store keys) track and clear identically" do
       # Same behavioral case as "ok reply clears the cid", on the FULL
       # micromarkets base/2 projection shape — the extra log-store keys
