@@ -527,4 +527,179 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Map.get(state.seen_periods, "alpha", MapSet.new()) == MapSet.new()
     assert state.seen_periods["beta"] == MapSet.new(["2026-07-01"])
   end
+
+  # ── pipeline health (O7) ──────────────────────────────────────────────────
+
+  defp status_health(state) do
+    {:reply, json, _} = Scope.handle_message(:cron, ~s({"action":"status"}), state)
+    Jason.decode!(json)["health"]
+  end
+
+  test "healthy tick: every touched stage records last_success_ms and no last_error" do
+    # topics envelope so the digest actually plans+sends a card — that
+    # touches all five stages (fetch, decode, detectors, digest, sender).
+    envelope = topics_envelope("wingston", "2026-07-01")
+
+    %{state: state} =
+      start_scope(fixture: %{"wingston" => %{dashboard: {:ok, envelope}, events: {:ok, []}}})
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+
+    health = status_health(state)["wingston"]
+
+    for stage <- ~w(fetch decode detectors digest sender) do
+      assert health[stage]["last_success_ms"] == @t0, "stage #{stage} missing success stamp"
+      assert health[stage]["last_error"] == nil, "stage #{stage} unexpectedly errored"
+    end
+  end
+
+  test "failing client: fetch errors with last_success_ms nil, and the other swarm stays healthy" do
+    {:ok, fake} =
+      Client.Fake.start_link(%{
+        # alpha's endpoint is down (no fixture entries -> {:error, :not_configured})
+        "alpha" => %{},
+        "beta" => healthy_fixture()
+      })
+
+    {:ok, clock} = Agent.start_link(fn -> @t0 end)
+    {:ok, outbox} = Agent.start_link(fn -> [] end)
+
+    config = %{
+      swarm_name: "observer",
+      registry: %{
+        "alpha" => %{dashboard_url: "http://a.example", token_env: nil, repo: nil},
+        "beta" => %{dashboard_url: "http://b.example", token_env: nil, repo: nil}
+      },
+      tick_sources: ["cron"],
+      read_sources: [],
+      alert_conversation_id: "tg:42:0",
+      client: Client.Fake,
+      client_opts: [fake: fake],
+      store_mod: NullStore,
+      now_fn: fn -> Agent.get(clock, & &1) end,
+      deliver_fn: fn target, from, content ->
+        Agent.update(outbox, &[%{target: target, from: from, content: content} | &1])
+        :ok
+      end
+    }
+
+    {:ok, state} = Scope.init(config)
+    {_reply, state} = decode_reply(tick(state))
+    health = status_health(state)
+
+    # alpha: fetch errored, never succeeded; decode never ran (nothing to
+    # decode); detectors still ran fine (endpoint_down is THEIR verdict).
+    assert health["alpha"]["fetch"]["last_success_ms"] == nil
+    assert health["alpha"]["fetch"]["last_error"] =~ "not_configured"
+    refute Map.has_key?(health["alpha"], "decode")
+    assert health["alpha"]["detectors"]["last_error"] == nil
+    assert health["alpha"]["detectors"]["last_success_ms"] == @t0
+
+    # beta: per-swarm isolation — alpha's broken endpoint leaks nothing here.
+    assert health["beta"]["fetch"]["last_success_ms"] == @t0
+    assert health["beta"]["fetch"]["last_error"] == nil
+    assert health["beta"]["decode"]["last_success_ms"] == @t0
+    assert health["beta"]["detectors"]["last_error"] == nil
+  end
+
+  test "fetch recovery clears last_error and stamps last_success_ms" do
+    %{state: state, fake: fake, clock: clock} =
+      start_scope(fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}})
+
+    {_reply, state} = decode_reply(tick(state))
+    health = status_health(state)["wingston"]
+    assert health["fetch"]["last_error"] =~ "econnrefused"
+    assert health["fetch"]["last_success_ms"] == nil
+
+    Client.Fake.put(fake, "wingston", healthy_fixture())
+    advance(clock, 60_000)
+    {_reply, state} = decode_reply(tick(state))
+
+    health = status_health(state)["wingston"]
+    assert health["fetch"]["last_error"] == nil
+    assert health["fetch"]["last_success_ms"] == @t0 + 60_000
+  end
+
+  test "a crashing detector marks the detectors stage errored, naming the module" do
+    defmodule CrashingDetector do
+      @behaviour Genswarms.Observer.Detector
+      def detect(_fetched, _ctx), do: raise("kaboom")
+    end
+
+    %{state: state} = start_scope()
+    state = %{state | detectors: [CrashingDetector]}
+
+    {reply, state} = decode_reply(tick(state))
+    # the crash still surfaces as a detector_crashed alert, as before
+    assert reply["alerts"] == 1
+
+    health = status_health(state)["wingston"]
+    assert health["detectors"]["last_error"] =~ "CrashingDetector"
+    assert health["detectors"]["last_success_ms"] == nil
+    # the crash never poisons the other stages
+    assert health["fetch"]["last_error"] == nil
+  end
+
+  test "a malformed conversation_topics extension marks the decode stage errored" do
+    bad_envelope =
+      Map.put(healthy_dashboard(), "extensions", %{
+        "conversation_topics" => %{"v" => 1, "periods" => "not-a-list"}
+      })
+
+    %{state: state} =
+      start_scope(fixture: %{"wingston" => %{dashboard: {:ok, bad_envelope}, events: {:ok, []}}})
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+
+    health = status_health(state)["wingston"]
+    assert health["decode"]["last_error"] =~ "malformed"
+    assert health["decode"]["last_success_ms"] == nil
+    assert health["fetch"]["last_error"] == nil
+  end
+
+  test "a failing deliver_fn marks the sender (and digest) stages errored" do
+    envelope = topics_envelope("wingston", "2026-07-01")
+
+    %{state: state} =
+      start_scope(
+        fixture: %{"wingston" => %{dashboard: {:ok, envelope}, events: {:ok, []}}},
+        config: %{deliver_fn: fn _target, _from, _content -> {:error, :boom} end}
+      )
+
+    {_reply, state} = decode_reply(tick(state))
+    health = status_health(state)["wingston"]
+
+    assert health["sender"]["last_error"] =~ "boom"
+    assert health["sender"]["last_success_ms"] == nil
+    assert health["digest"]["last_error"] =~ "planned 1 card(s), delivered 0"
+    # the pipeline up to the sender was fine
+    assert health["fetch"]["last_error"] == nil
+    assert health["decode"]["last_error"] == nil
+  end
+
+  test "dashboard/1 exposes the compact per-swarm health summary" do
+    %{state: state} = start_scope(fixture: %{"wingston" => %{dashboard: {:error, :down}}})
+    {_reply, state} = decode_reply(tick(state))
+
+    assert [%{kind: :extension, name: "observer", data: data}] = Scope.dashboard(state)
+    assert data.health == %{"wingston" => %{ok: false, failing: [:fetch]}}
+
+    # and status carries the full map alongside
+    health = status_health(state)["wingston"]
+    assert health["fetch"]["last_error"] != nil
+  end
+
+  test "dashboard summary reads ok:true for a healthy swarm and before any tick" do
+    %{state: state} = start_scope()
+
+    # before any tick: no health entries at all — summary is empty, not failing
+    assert [%{data: %{health: pre}}] = Scope.dashboard(state)
+    assert pre == %{}
+
+    {_reply, state} = decode_reply(tick(state))
+    assert [%{data: %{health: post}}] = Scope.dashboard(state)
+    assert post == %{"wingston" => %{ok: true, failing: []}}
+  end
 end

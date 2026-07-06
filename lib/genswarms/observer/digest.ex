@@ -138,6 +138,50 @@ defmodule Genswarms.Observer.Digest do
 
   def plan(_swarm, _envelope, _seen), do: {[], []}
 
+  @doc """
+  Pure decode-health probe for the `conversation_topics` extension — the
+  discrimination `plan/3` deliberately flattens away (it answers `{[], []}`
+  for absent AND malformed alike, which is right for card planning but
+  useless for self-observability). Mirrors the raw `get_in` read the
+  `TopicsStale` detector uses:
+
+  - `:absent` — no `"extensions"` map key, or no `"conversation_topics"`
+    key inside it. Not an error: the swarm may simply not run the topics
+    feature, so the decode stage counts this as success-with-nothing-to-do.
+  - `:ok` — the extension is a map carrying a `"periods"` list whose
+    entries are all maps. Version (`"v"`) is NOT checked here — an unknown
+    future version still decodes; gating on `v == 1` is `plan/3`'s concern.
+  - `:malformed` — anything else: the key is present but the block is not
+    a map, has no `"periods"` list, or carries non-map period entries; a
+    non-map `"extensions"` value or a non-map envelope also lands here.
+
+  Total, never raises.
+  """
+  @spec decode_health(term) :: :ok | :absent | :malformed
+  def decode_health(envelope) when is_map(envelope) do
+    case Map.get(envelope, "extensions") do
+      nil ->
+        :absent
+
+      exts when is_map(exts) ->
+        case Map.fetch(exts, "conversation_topics") do
+          :error -> :absent
+          {:ok, ext} -> extension_health(ext)
+        end
+
+      _other ->
+        :malformed
+    end
+  end
+
+  def decode_health(_envelope), do: :malformed
+
+  defp extension_health(%{"periods" => periods}) when is_list(periods) do
+    if Enum.all?(periods, &is_map/1), do: :ok, else: :malformed
+  end
+
+  defp extension_health(_), do: :malformed
+
   # ── extraction / validation ────────────────────────────────────────────────
 
   defp get_extension(envelope) do

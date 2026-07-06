@@ -375,4 +375,53 @@ defmodule Genswarms.Observer.DigestTest do
       end
     end
   end
+
+  # ── decode_health/1 (O7) ─────────────────────────────────────────────────
+
+  describe "decode_health/1" do
+    test "ok for a well-formed extension (regardless of pending/empty periods)" do
+      assert Digest.decode_health(envelope([period("2026-07-01")])) == :ok
+      assert Digest.decode_health(envelope([])) == :ok
+      assert Digest.decode_health(envelope([period("2026-07-01", final: false)])) == :ok
+      # an unknown future version still DECODES — version gating is plan/3's job
+      assert Digest.decode_health(envelope([period("2026-07-01")], v: 2)) == :ok
+    end
+
+    test "absent when the extension key is not there at all" do
+      assert Digest.decode_health(%{"swarm" => "wingston"}) == :absent
+      assert Digest.decode_health(%{"swarm" => "wingston", "extensions" => %{}}) == :absent
+      assert Digest.decode_health(%{}) == :absent
+    end
+
+    test "malformed when the key is present but the block is broken" do
+      # extension not a map
+      assert Digest.decode_health(%{"extensions" => %{"conversation_topics" => "nope"}}) ==
+               :malformed
+
+      assert Digest.decode_health(%{"extensions" => %{"conversation_topics" => nil}}) ==
+               :malformed
+
+      assert Digest.decode_health(%{"extensions" => %{"conversation_topics" => [1, 2]}}) ==
+               :malformed
+
+      # map but no periods list
+      assert Digest.decode_health(%{"extensions" => %{"conversation_topics" => %{"v" => 1}}}) ==
+               :malformed
+
+      # periods not a list
+      assert Digest.decode_health(%{
+               "extensions" => %{"conversation_topics" => %{"v" => 1, "periods" => "nope"}}
+             }) == :malformed
+
+      # periods a list of non-maps
+      assert Digest.decode_health(%{
+               "extensions" => %{"conversation_topics" => %{"v" => 1, "periods" => [1, "two"]}}
+             }) == :malformed
+
+      # extensions itself not a map, or the envelope not a map — broken, never a crash
+      assert Digest.decode_health(%{"extensions" => "nope"}) == :malformed
+      assert Digest.decode_health(nil) == :malformed
+      assert Digest.decode_health("garbage") == :malformed
+    end
+  end
 end

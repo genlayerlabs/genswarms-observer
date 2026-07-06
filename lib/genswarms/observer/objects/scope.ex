@@ -175,7 +175,15 @@ defmodule Genswarms.Observer.Objects.Scope do
       # `alerts` first). `relay_log` is metadata-only, never transcript
       # content — see `log_relay/6`.
       relay_counts: %{},
-      relay_log: []
+      relay_log: [],
+      # O7: per-stage pipeline self-observability, per observed swarm:
+      # `%{swarm => %{stage => %{last_success_ms: int | nil, last_error:
+      # nil | string}}}` for stages :fetch / :decode / :detectors /
+      # :digest / :sender. Updated inside tick/1 as each stage actually
+      # runs — a stage that didn't run this tick keeps its previous entry.
+      # Session-local bookkeeping, deliberately NOT persisted (health is a
+      # statement about THIS process's pipeline, not durable history).
+      health: %{}
     }
 
     {:ok, load_store(state, now_fn.())}
@@ -401,7 +409,8 @@ defmodule Genswarms.Observer.Objects.Scope do
           items:
             Enum.map(state.alerts, fn a ->
               %{swarm: a.swarm, type: a.type, at_ms: a.at_ms, summary: a.summary}
-            end)
+            end),
+          health: health_summary(state.health)
         }
       }
     ]
@@ -421,12 +430,19 @@ defmodule Genswarms.Observer.Objects.Scope do
       Enum.reduce(state.registry, {state, pending_fired, pending_suppressed}, fn {swarm, entry},
                                                                                   {st, fired, supp} ->
         data = fetch(swarm, entry, st)
+
+        st =
+          st
+          |> record_fetch_health(swarm, data, now)
+          |> record_decode_health(swarm, data, now)
+
         swarm_det_states = Map.get(st.det, swarm, %{})
 
-        {alerts, swarm_det_states, _health} =
+        {alerts, swarm_det_states, det_health} =
           DetectorRunner.run(detectors_for(st, swarm), data, swarm, st.thresholds, swarm_det_states, now)
 
         st = %{st | det: Map.put(st.det, swarm, swarm_det_states)}
+        st = record_detector_health(st, swarm, det_health, now)
 
         {passed, supp} =
           Enum.reduce(alerts, {[], supp}, fn alert, {passed, supp} ->
@@ -439,9 +455,9 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         budgeted = apply_alert_budget(Enum.reverse(passed), swarm, now)
 
-        st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry) end)
+        st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry, now) end)
 
-        st = deliver_digest(st, swarm, data)
+        st = deliver_digest(st, swarm, data, now)
 
         {st, fired + length(budgeted), supp}
       end)
@@ -474,7 +490,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   defp drain_pending_alerts(state, now) do
     Enum.reduce(state.pending_alerts, {%{state | pending_alerts: []}, 0, 0}, fn alert, {st, fired, supp} ->
       if cooled_down?(st, alert, now) do
-        {emit_alert(st, alert, %{}), fired + 1, supp}
+        {emit_alert(st, alert, %{}, now), fired + 1, supp}
       else
         {st, fired, supp + 1}
       end
@@ -567,28 +583,27 @@ defmodule Genswarms.Observer.Objects.Scope do
   # delivered `:ok` this tick — a partial failure retries the whole batch
   # next tick rather than silently losing a period. Cards are idempotent
   # content, so re-sending an already-delivered one on retry is harmless.
-  defp deliver_digest(state, swarm, %{dashboard: {:ok, envelope}}) do
+  defp deliver_digest(state, swarm, %{dashboard: {:ok, envelope}}, now) do
     seen = Map.get(state.seen_periods, swarm, MapSet.new())
     {cards, newly_seen} = Digest.plan(swarm, envelope, seen)
 
-    case send_cards(state, cards) do
-      :ok when newly_seen != [] ->
-        updated = MapSet.union(seen, MapSet.new(newly_seen))
-        %{state | seen_periods: Map.put(state.seen_periods, swarm, updated)}
+    results = Enum.map(cards, &deliver_digest_card(state, &1))
+    delivered = Enum.count(results, &(&1 == :ok))
 
-      _ ->
-        state
+    state =
+      state
+      |> record_digest_health(swarm, length(cards), delivered, now)
+      |> record_sender_batch(swarm, results, now)
+
+    if delivered == length(cards) and newly_seen != [] do
+      updated = MapSet.union(seen, MapSet.new(newly_seen))
+      %{state | seen_periods: Map.put(state.seen_periods, swarm, updated)}
+    else
+      state
     end
   end
 
-  defp deliver_digest(state, _swarm, _data), do: state
-
-  defp send_cards(_state, []), do: :ok
-
-  defp send_cards(state, cards) do
-    results = Enum.map(cards, &deliver_digest_card(state, &1))
-    if Enum.all?(results, &(&1 == :ok)), do: :ok, else: :error
-  end
+  defp deliver_digest(state, _swarm, _data, _now), do: state
 
   defp deliver_digest_card(state, card) do
     payload =
@@ -611,7 +626,147 @@ defmodule Genswarms.Observer.Objects.Scope do
     end
   end
 
-  defp emit_alert(state, alert, entry) do
+  # ── pipeline health (O7): per-swarm, per-stage self-observability ─────────
+  #
+  # `state.health[swarm][stage] = %{last_success_ms: int | nil, last_error:
+  # nil | string}` for the stages :fetch, :decode, :detectors, :digest and
+  # :sender. Recording is strictly per stage-run: success stamps
+  # `last_success_ms` and CLEARS `last_error`; failure sets `last_error`
+  # and leaves `last_success_ms` at whatever it was (nil if the stage never
+  # succeeded). A stage that didn't run this tick is not touched at all.
+  # These helpers must NEVER raise — any weird shape degrades to an error
+  # string via inspect, never a crash mid-tick.
+
+  @health_error_cap 500
+
+  # :fetch — both client calls of this tick's fetch. Any non-{:ok, _}
+  # (including a shape a buggy client invented) counts as a fetch error.
+  defp record_fetch_health(state, swarm, data, now) do
+    errors =
+      Enum.flat_map(data, fn
+        {_part, {:ok, _}} -> []
+        {part, {:error, reason}} -> ["#{part}: #{health_error(reason)}"]
+        {part, other} -> ["#{part}: malformed client return #{health_error(other)}"]
+      end)
+
+    case errors do
+      [] -> record_health(state, swarm, :fetch, now, :ok)
+      errs -> record_health(state, swarm, :fetch, now, {:error, Enum.join(Enum.sort(errs), "; ")})
+    end
+  end
+
+  # :decode — the conversation_topics extension parse. Only runs when the
+  # dashboard actually fetched (otherwise there is nothing to decode and
+  # the stage keeps its previous entry). "Extension absent" is success
+  # with nothing to do; "present but malformed" is the decode error.
+  defp record_decode_health(state, swarm, %{dashboard: {:ok, envelope}}, now) do
+    case Digest.decode_health(envelope) do
+      :malformed ->
+        record_health(
+          state,
+          swarm,
+          :decode,
+          now,
+          {:error, "conversation_topics extension present but malformed"}
+        )
+
+      _ok_or_absent ->
+        record_health(state, swarm, :decode, now, :ok)
+    end
+  end
+
+  defp record_decode_health(state, _swarm, _data, _now), do: state
+
+  # :detectors — from DetectorRunner's health return: any module ok:false
+  # (crash, timeout, malformed return, invalid alerts) fails the stage,
+  # naming the module(s).
+  defp record_detector_health(state, swarm, det_health, now) do
+    failing = for %{module: mod, ok: false} <- det_health, do: inspect(mod)
+
+    case failing do
+      [] ->
+        record_health(state, swarm, :detectors, now, :ok)
+
+      mods ->
+        record_health(
+          state,
+          swarm,
+          :detectors,
+          now,
+          {:error, "failing: " <> Enum.join(mods, ", ")}
+        )
+    end
+  end
+
+  # :digest — cards planned vs delivered. Zero planned cards is a healthy
+  # no-op run (the digest machinery did its job: nothing to send).
+  defp record_digest_health(state, swarm, planned, planned, now),
+    do: record_health(state, swarm, :digest, now, :ok)
+
+  defp record_digest_health(state, swarm, planned, delivered, now) do
+    record_health(
+      state,
+      swarm,
+      :digest,
+      now,
+      {:error, "planned #{planned} card(s), delivered #{delivered}"}
+    )
+  end
+
+  # :sender — the raw deliver_fn outcome, shared by alert cards and digest
+  # cards; the MOST RECENT outcome wins. An empty batch never ran the
+  # sender, so it doesn't touch the stage.
+  defp record_sender_batch(state, _swarm, [], _now), do: state
+
+  defp record_sender_batch(state, swarm, results, now),
+    do: record_sender_result(state, swarm, List.last(results), now)
+
+  defp record_sender_result(state, swarm, :ok, now),
+    do: record_health(state, swarm, :sender, now, :ok)
+
+  defp record_sender_result(state, swarm, other, now) do
+    record_health(
+      state,
+      swarm,
+      :sender,
+      now,
+      {:error, "deliver_fn returned #{health_error(other)}"}
+    )
+  end
+
+  defp record_health(state, swarm, stage, now, outcome) do
+    if is_binary(swarm) and Map.has_key?(state.registry, swarm) do
+      swarm_health = Map.get(state.health, swarm, %{})
+      entry = Map.get(swarm_health, stage, %{last_success_ms: nil, last_error: nil})
+
+      entry =
+        case outcome do
+          :ok -> %{entry | last_success_ms: now, last_error: nil}
+          {:error, reason} -> %{entry | last_error: health_error(reason)}
+        end
+
+      %{state | health: Map.put(state.health, swarm, Map.put(swarm_health, stage, entry))}
+    else
+      # System-level alerts (e.g. :store_rollback) carry the observer's own
+      # swarm name — never mint a phantom key in the per-observed-swarm map.
+      state
+    end
+  end
+
+  defp health_error(reason) when is_binary(reason), do: String.slice(reason, 0, @health_error_cap)
+  defp health_error(reason), do: reason |> inspect() |> String.slice(0, @health_error_cap)
+
+  # Compact per-swarm summary for the dashboard extension: healthy unless
+  # some stage carries a live last_error. Never-run stages simply aren't
+  # in the map, so they count as healthy.
+  defp health_summary(health) do
+    Map.new(health, fn {swarm, stages} ->
+      failing = for {stage, %{last_error: err}} <- stages, err != nil, do: stage
+      {swarm, %{ok: failing == [], failing: Enum.sort(failing)}}
+    end)
+  end
+
+  defp emit_alert(state, alert, entry, now) do
     card = alert_card(alert, entry)
 
     payload =
@@ -621,17 +776,22 @@ defmodule Genswarms.Observer.Objects.Scope do
         "card" => card
       })
 
-    case state.deliver_fn.(state.sender, state.name, payload) do
-      :ok ->
-        :ok
+    result =
+      case state.deliver_fn.(state.sender, state.name, payload) do
+        :ok ->
+          :ok
 
-      other ->
-        Logger.warning(
-          "[observer] alert delivery to #{inspect(state.sender)} returned #{inspect(other)}"
-        )
-    end
+        other ->
+          Logger.warning(
+            "[observer] alert delivery to #{inspect(state.sender)} returned #{inspect(other)}"
+          )
+
+          other
+      end
 
     escalate(state, alert)
+
+    state = record_sender_result(state, alert.swarm, result, now)
 
     %{
       state
@@ -847,7 +1007,8 @@ defmodule Genswarms.Observer.Objects.Scope do
          Enum.map(state.alerts, fn a ->
            %{swarm: a.swarm, type: a.type, at_ms: a.at_ms, summary: a.summary}
          end),
-       relay_log: state.relay_log
+       relay_log: state.relay_log,
+       health: state.health
      }), state}
   end
 
