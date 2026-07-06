@@ -38,17 +38,23 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
   # Minimal wingston-shaped feed event (provenance above).
   defp ev(kind, cid, ms, extra \\ %{}) do
-    Map.merge(%{"kind" => kind, "cid" => cid, "seq" => 1, "ts" => ts(ms)}, extra)
+    # Generate unique seq based on ms so distinct events don't collide on seq.
+    # Real wires stamp monotonic per-session seqs; this deterministic mapping
+    # ensures test fixtures behave like real ones (distinct events → distinct seqs).
+    seq = 1 + abs(Kernel.div(ms, 1000))
+    Map.merge(%{"kind" => kind, "cid" => cid, "seq" => seq, "ts" => ts(ms)}, extra)
   end
 
   # Full micromarkets-shaped feed event (provenance above).
   defp mm_ev(kind, cid, ms, extra) do
+    # Generate unique seq based on ms like ev() does
+    seq = 1 + abs(Kernel.div(ms, 1000))
     Map.merge(
       %{
         "kind" => kind,
         "cid" => cid,
         "ts" => ts(ms),
-        "seq" => 1,
+        "seq" => seq,
         "source" => "log_store",
         "log_id" => 42,
         "event_type" => "telegram_reply",
@@ -452,8 +458,8 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       # wingston reply_failed carries `from`, never a cid — the target could
       # not be resolved (objects/event_feed.ex:39).
       events =
-        for ms <- [0, 100_000, 200_000] do
-          %{"kind" => "reply_failed", "from" => "agent_3", "seq" => 1, "ts" => ts(ms)}
+        for {ms, seq} <- [{0, 1}, {100_000, 101}, {200_000, 201}] do
+          %{"kind" => "reply_failed", "from" => "agent_3", "seq" => seq, "ts" => ts(ms)}
         end
 
       f = fetched(events)
@@ -474,7 +480,7 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       # below threshold raises nothing, but the failure is now REMEMBERED
       # (accumulate-and-prune state) for the cross-tick window
-      assert {[], %{fail_ts: %{"tg:2:0" => [0]}}} = DeliveryFailureBurst.detect(f, ctx)
+      assert {[], %{fail_ts: %{"tg:2:0" => [{{:seq, 1}, 0}]}}} = DeliveryFailureBurst.detect(f, ctx)
     end
 
     test "events outside the window are excluded from the count" do
@@ -565,11 +571,11 @@ defmodule Genswarms.Observer.DetectorsUxTest do
     end
 
     test "reply_failed events accumulate across ticks into :reply_failed_burst" do
-      rf = fn ms -> %{"kind" => "reply_failed", "from" => "agent_3", "seq" => 1, "ts" => ts(ms)} end
+      rf = fn ms, seq -> %{"kind" => "reply_failed", "from" => "agent_3", "seq" => seq, "ts" => ts(ms)} end
 
-      {[], s1} = burst_tick(nil, [rf.(0)], 10_000)
-      {[], s2} = burst_tick(s1, [rf.(100_000)], 110_000)
-      {alerts, _s3} = burst_tick(s2, [rf.(200_000)], 210_000)
+      {[], s1} = burst_tick(nil, [rf.(0, 1)], 10_000)
+      {[], s2} = burst_tick(s1, [rf.(100_000, 101)], 110_000)
+      {alerts, _s3} = burst_tick(s2, [rf.(200_000, 201)], 210_000)
 
       assert [%{type: :reply_failed_burst}] = alerts
     end
@@ -608,6 +614,58 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       {[], s2} = burst_tick(s1, [], 0 + 600_000 + 60_000)
       refute Map.has_key?(s2.fail_ts, "tg:9:9")
+    end
+  end
+
+  describe "DeliveryFailureBurst — F9: distinct same-ms events both count" do
+    @tag regression: "F9"
+    test "two reply_failed with the same ts but different seq both count toward the burst" do
+      ts = 1_751_734_800.0
+
+      events = [
+        %{"kind" => "reply_failed", "seq" => 10, "ts" => ts},
+        %{"kind" => "reply_failed", "seq" => 11, "ts" => ts},
+        %{"kind" => "reply_failed", "seq" => 12, "ts" => ts + 1.0}
+      ]
+
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"delivery_failure.count" => 3, "delivery_failure.window_s" => 600},
+        state: nil,
+        now_ms: round((ts + 2) * 1000)
+      }
+
+      assert {[alert], _} =
+               Genswarms.Observer.Detectors.DeliveryFailureBurst.detect(
+                 %{feed: {:ok, events}},
+                 ctx
+               )
+
+      assert alert.type == :reply_failed_burst
+      assert alert.evidence["count"] == 3
+    end
+
+    @tag regression: "F9"
+    test "ring-replay of the same seq is still deduped (restart safety)" do
+      ts = 1_751_734_800.0
+      events = [%{"kind" => "reply_failed", "seq" => 10, "ts" => ts}]
+
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"delivery_failure.count" => 2, "delivery_failure.window_s" => 600},
+        state: nil,
+        now_ms: round((ts + 2) * 1000)
+      }
+
+      {[], state} =
+        Genswarms.Observer.Detectors.DeliveryFailureBurst.detect(%{feed: {:ok, events}}, ctx)
+
+      # Same event replayed (observer restart, cursor reset): must not double-count.
+      assert {[], _} =
+               Genswarms.Observer.Detectors.DeliveryFailureBurst.detect(
+                 %{feed: {:ok, events}},
+                 %{ctx | state: state}
+               )
     end
   end
 

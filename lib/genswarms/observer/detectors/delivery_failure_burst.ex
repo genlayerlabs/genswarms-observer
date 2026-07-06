@@ -90,26 +90,44 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
   # default) or malformed (a poisoned store entry) — restart clean rather
   # than crash the tick.
   defp normalize_state(%{fail_ts: fail_ts, reply_failed_ts: rf})
-       when is_map(fail_ts) and is_list(rf),
-       do: %{fail_ts: fail_ts, reply_failed_ts: rf}
+       when is_map(fail_ts) and is_list(rf) do
+    %{
+      fail_ts: Map.new(fail_ts, fn {cid, list} -> {cid, migrate_entries(list)} end),
+      reply_failed_ts: migrate_entries(rf)
+    }
+  end
 
   defp normalize_state(_), do: empty_state()
+
+  # Old persisted format: bare ms integers. New: {dedupe_key, ms}. Old
+  # entries keep ts-keyed dedupe (exactly the old behavior) until they age
+  # out of the window.
+  defp migrate_entries(list) when is_list(list) do
+    Enum.flat_map(list, fn
+      {_key, ms} = entry when is_integer(ms) -> [entry]
+      ms when is_integer(ms) -> [{{:ts, ms}, ms}]
+      _ -> []
+    end)
+  end
+
+  defp migrate_entries(_), do: []
 
   defp ingest(state, events) do
     Enum.reduce(events, state, fn ev, st ->
       case event_ms(ev) do
-        # non-number ts: skipped — it cannot sit in a time window
         nil ->
           st
 
         ms ->
+          entry = {dedupe_key(ev, ms), ms}
+
           cond do
             failed_reply_sent?(ev) ->
               cid = ev["cid"]
-              update_in(st.fail_ts[cid], &append_dedup(&1, ms))
+              update_in(st.fail_ts[cid], &append_dedup(&1, entry))
 
             kind(ev) == "reply_failed" ->
-              %{st | reply_failed_ts: append_dedup(st.reply_failed_ts, ms)}
+              %{st | reply_failed_ts: append_dedup(st.reply_failed_ts, entry)}
 
             true ->
               st
@@ -118,12 +136,18 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     end)
   end
 
-  # Exact-ts dedupe: restart ring replays re-deliver events already counted
-  # into persisted state (see moduledoc). Two DISTINCT failures for one cid
-  # in the same millisecond do not happen on either wire (the sender is
-  # serial per conversation).
-  defp append_dedup(nil, ms), do: [ms]
-  defp append_dedup(list, ms), do: if(ms in list, do: list, else: [ms | list])
+  # F9: dedupe by the wire's seq (unique + monotonic on both known wires:
+  # wingston event_feed.ex stamps seq on every display event, micromarkets
+  # base/2 ditto) — exact-ts collapsed two DISTINCT same-millisecond
+  # reply_faileds into one. ts remains the fallback key for a seq-less host.
+  defp dedupe_key(%{"seq" => seq}, _ms) when is_integer(seq), do: {:seq, seq}
+  defp dedupe_key(_ev, ms), do: {:ts, ms}
+
+  defp append_dedup(nil, entry), do: [entry]
+
+  defp append_dedup(list, {key, _ms} = entry) do
+    if List.keymember?(list, key, 0), do: list, else: [entry | list]
+  end
 
   defp prune(state, now_ms, window_ms) do
     fail_ts =
@@ -143,8 +167,8 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     }
   end
 
-  defp prune_list(ts_list, now_ms, window_ms),
-    do: Enum.filter(ts_list, &(now_ms - &1 <= window_ms))
+  defp prune_list(entries, now_ms, window_ms),
+    do: Enum.filter(entries, fn {_key, ms} -> now_ms - ms <= window_ms end)
 
   defp cid_burst_alerts(state, swarm, now_ms, count_threshold, window_s) do
     state.fail_ts

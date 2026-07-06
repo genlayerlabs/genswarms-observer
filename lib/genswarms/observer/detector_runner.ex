@@ -23,6 +23,7 @@ defmodule Genswarms.Observer.DetectorRunner do
   """
 
   alias Genswarms.Observer.Detector
+  require Logger
 
   @default_timeout_ms 2_000
 
@@ -38,7 +39,7 @@ defmodule Genswarms.Observer.DetectorRunner do
   def run(modules, fetched, swarm, global_thresholds, states, now_ms, timeout_ms \\ @default_timeout_ms) do
     Enum.reduce(modules, {[], states, []}, fn mod, {alerts, sts, health} ->
       prior = Map.get(sts, mod, initial_state(mod))
-      thresholds = Map.merge(defaults(mod), global_thresholds || %{})
+      thresholds = merge_thresholds(defaults(mod), global_thresholds || %{})
       ctx = %{swarm: swarm, thresholds: thresholds, state: prior, now_ms: now_ms}
 
       case run_one(mod, fetched, ctx, timeout_ms) do
@@ -167,4 +168,54 @@ defmodule Genswarms.Observer.DetectorRunner do
       nil
     end
   end
+
+  # F6: `thresholds` is x-mutable operator input (schema type: bare object)
+  # merged into every detector — a wrong-typed value either crashes detect/2
+  # (arithmetic on a string) or silently disables it (Erlang term ordering:
+  # integer < binary makes `count >= "3"` always false). Validate per key
+  # against the DEFAULT's type: numeric default + numeric-string override →
+  # coerce; type mismatch → keep the default and warn; keys without a
+  # default pass through untouched (they belong to another module's
+  # namespace — the boot-time collision check keeps namespaces disjoint).
+  defp merge_thresholds(defaults, overrides) do
+    Enum.reduce(overrides, defaults, fn {key, value}, acc ->
+      case Map.fetch(defaults, key) do
+        :error ->
+          Map.put(acc, key, value)
+
+        {:ok, default} ->
+          case coerce_threshold(default, value) do
+            {:ok, coerced} ->
+              Map.put(acc, key, coerced)
+
+            :error ->
+              Logger.warning(
+                "[observer] threshold #{inspect(key)}=#{inspect(value)} does not match the " <>
+                  "default's type (#{inspect(default)}) — keeping the default"
+              )
+
+              acc
+          end
+      end
+    end)
+  end
+
+  defp coerce_threshold(default, value) when is_number(default) and is_number(value),
+    do: {:ok, value}
+
+  defp coerce_threshold(default, value) when is_number(default) and is_binary(value) do
+    case Float.parse(value) do
+      {f, ""} -> {:ok, if(is_integer(default), do: round(f), else: f)}
+      _ -> :error
+    end
+  end
+
+  defp coerce_threshold(default, value)
+       when is_boolean(default) and is_boolean(value),
+       do: {:ok, value}
+
+  defp coerce_threshold(default, value) when is_binary(default) and is_binary(value),
+    do: {:ok, value}
+
+  defp coerce_threshold(_default, _value), do: :error
 end

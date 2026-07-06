@@ -115,4 +115,68 @@ defmodule DetectorRunnerTest do
     assert Enum.any?(alerts, &(&1.type == :detector_invalid))
     assert states[Malformed] == %{poisoned: false}
   end
+
+  defmodule TypedThresholdDetector do
+    @behaviour Genswarms.Observer.Detector
+    def default_thresholds, do: %{"typed.count" => 3}
+
+    def detect(_fetched, ctx) do
+      {[
+         %{
+           type: :typed_probe,
+           swarm: ctx.swarm,
+           at_ms: ctx.now_ms,
+           summary: "count=#{inspect(ctx.thresholds["typed.count"])}",
+           evidence: %{"count" => ctx.thresholds["typed.count"]}
+         }
+       ], ctx.state}
+    end
+  end
+
+  describe "F6: threshold overrides are type-validated at merge" do
+    @tag regression: "F6"
+    test "a numeric-string override is coerced to the default's type" do
+      {[alert], _, _} =
+        Genswarms.Observer.DetectorRunner.run(
+          [TypedThresholdDetector],
+          %{},
+          "w",
+          %{"typed.count" => "5"},
+          %{},
+          1_000
+        )
+
+      assert alert.evidence["count"] == 5
+    end
+
+    @tag regression: "F6"
+    test "a non-numeric override falls back to the module default" do
+      {[alert], _, _} =
+        Genswarms.Observer.DetectorRunner.run(
+          [TypedThresholdDetector],
+          %{},
+          "w",
+          %{"typed.count" => "lots"},
+          %{},
+          1_000
+        )
+
+      assert alert.evidence["count"] == 3
+    end
+
+    @tag regression: "F6"
+    test "an override for a key with no default passes through untouched" do
+      {[alert], _, _} =
+        Genswarms.Observer.DetectorRunner.run(
+          [TypedThresholdDetector],
+          %{},
+          "w",
+          %{"typed.count" => 4, "someone.elses" => "free"},
+          %{},
+          1_000
+        )
+
+      assert alert.evidence["count"] == 4
+    end
+  end
 end
