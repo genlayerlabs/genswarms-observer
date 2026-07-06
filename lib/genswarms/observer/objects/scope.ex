@@ -41,6 +41,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   alias Genswarms.Observer.Detectors
   alias Genswarms.Observer.DetectorRunner
+  alias Genswarms.Observer.Digest
 
   require Logger
 
@@ -325,6 +326,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     now = state.now_fn.()
     orig_det = state.det
     orig_last_alert = state.last_alert
+    orig_seen_periods = state.seen_periods
 
     {state, pending_fired, pending_suppressed} = drain_pending_alerts(state, now)
 
@@ -352,13 +354,16 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry) end)
 
+        st = deliver_digest(st, swarm, data)
+
         {st, fired + length(budgeted), supp}
       end)
 
     state = %{state | last_tick_ms: now}
 
     state =
-      if state.det != orig_det or state.last_alert != orig_last_alert do
+      if state.det != orig_det or state.last_alert != orig_last_alert or
+           state.seen_periods != orig_seen_periods do
         persist(state)
       else
         state
@@ -460,6 +465,60 @@ defmodule Genswarms.Observer.Objects.Scope do
       }
 
       kept ++ [coalesced]
+    end
+  end
+
+  # ── digest (O4): conversation_topics extension → cards, seen-after-send ────
+  #
+  # Runs AFTER the detector/alert phase for this swarm, over the SAME fetch
+  # (`data`) already pulled this tick — no extra round-trip. `Digest.plan/2`
+  # is pure and total: a missing/malformed extension yields `{[], []}` and
+  # this is a no-op. Cards are sent one by one; `seen_periods` is only
+  # merged (and the tick only marked dirty) when EVERY card for this swarm
+  # delivered `:ok` this tick — a partial failure retries the whole batch
+  # next tick rather than silently losing a period. Cards are idempotent
+  # content, so re-sending an already-delivered one on retry is harmless.
+  defp deliver_digest(state, swarm, %{dashboard: {:ok, envelope}}) do
+    seen = Map.get(state.seen_periods, swarm, MapSet.new())
+    {cards, newly_seen} = Digest.plan(envelope, seen)
+
+    case send_cards(state, cards) do
+      :ok when newly_seen != [] ->
+        updated = MapSet.union(seen, MapSet.new(newly_seen))
+        %{state | seen_periods: Map.put(state.seen_periods, swarm, updated)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp deliver_digest(state, _swarm, _data), do: state
+
+  defp send_cards(_state, []), do: :ok
+
+  defp send_cards(state, cards) do
+    results = Enum.map(cards, &deliver_digest_card(state, &1))
+    if Enum.all?(results, &(&1 == :ok)), do: :ok, else: :error
+  end
+
+  defp deliver_digest_card(state, card) do
+    payload =
+      Jason.encode!(%{
+        "action" => "send_card",
+        "conversation_id" => state.alert_conversation_id,
+        "card" => card
+      })
+
+    case state.deliver_fn.(state.sender, state.name, payload) do
+      :ok ->
+        :ok
+
+      other ->
+        Logger.warning(
+          "[observer] digest delivery to #{inspect(state.sender)} returned #{inspect(other)}"
+        )
+
+        other
     end
   end
 

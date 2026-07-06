@@ -36,6 +36,32 @@ defmodule Genswarms.Observer.ScopeTest do
     }
   end
 
+  # A healthy dashboard (no detector alerts) carrying one final, unseen
+  # `conversation_topics` period — isolates the digest path from the
+  # alert-cooldown machinery in the tests below.
+  defp topics_envelope(swarm, period_id) do
+    healthy_dashboard()
+    |> Map.put("swarm", swarm)
+    |> Map.put("extensions", %{
+      "conversation_topics" => %{
+        "v" => 1,
+        "coverage" => "dm",
+        "periods" => [
+          %{
+            "period_id" => period_id,
+            "final" => true,
+            "status" => "ok",
+            "generated_at" => "#{period_id}T00:00:00Z",
+            "source_watermark" => 1,
+            "topics" => [%{"label" => "billing", "count" => 3}],
+            "counts" => %{"conversations" => 5, "turns" => 9},
+            "signals" => []
+          }
+        ]
+      }
+    })
+  end
+
   defp start_scope(opts \\ []) do
     {:ok, fake} = Client.Fake.start_link(Keyword.get(opts, :fixture, %{"wingston" => healthy_fixture()}))
     {:ok, clock} = Agent.start_link(fn -> @t0 end)
@@ -377,5 +403,128 @@ defmodule Genswarms.Observer.ScopeTest do
              Scope.dashboard(state)
 
     assert item.type == :endpoint_down
+  end
+
+  # ── digest (O4) ───────────────────────────────────────────────────────────
+
+  test "a fresh unseen digest period sends one card to :sender and marks it seen" do
+    envelope = topics_envelope("wingston", "2026-07-01")
+
+    %{state: state, outbox: outbox} =
+      start_scope(fixture: %{"wingston" => %{dashboard: {:ok, envelope}, events: {:ok, []}}})
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["alerts"] == 0
+
+    [delivery] = sent(outbox)
+    assert delivery.target == :sender
+
+    msg = Jason.decode!(delivery.content)
+    assert msg["action"] == "send_card"
+    assert msg["conversation_id"] == "tg:42:0"
+    assert msg["card"]["title"] =~ "digest: wingston · 2026-07-01"
+
+    assert state.seen_periods["wingston"] == MapSet.new(["2026-07-01"])
+
+    # ticking again with the same (now-seen) period sends nothing more.
+    {_reply, _state} = decode_reply(tick(state))
+    assert length(sent(outbox)) == 1
+  end
+
+  test "a malformed conversation_topics extension never crashes a tick, and sends no digest card" do
+    # Map-shaped (so the unrelated TopicsStale detector's own get_in reads
+    # stay well-formed and silent — a swarm that's never shown a periods
+    # list before raises nothing there) but wrong/garbage at the fields
+    # Digest.plan/2 actually cares about.
+    bad_envelope =
+      Map.put(healthy_dashboard(), "extensions", %{
+        "conversation_topics" => %{"v" => 1, "periods" => "not-a-list"}
+      })
+
+    %{state: state, outbox: outbox} =
+      start_scope(fixture: %{"wingston" => %{dashboard: {:ok, bad_envelope}, events: {:ok, []}}})
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+    assert reply["alerts"] == 0
+    assert sent(outbox) == []
+    assert Map.get(state.seen_periods, "wingston", MapSet.new()) == MapSet.new()
+  end
+
+  test "seen-after-send: a failed digest delivery marks nothing, and the whole batch retries next tick" do
+    envelope = topics_envelope("wingston", "2026-07-01")
+
+    {:ok, gate} = Agent.start_link(fn -> :fail end)
+    {:ok, mine} = Agent.start_link(fn -> [] end)
+
+    %{state: state, clock: clock} =
+      start_scope(
+        fixture: %{"wingston" => %{dashboard: {:ok, envelope}, events: {:ok, []}}},
+        config: %{
+          deliver_fn: fn target, from, content ->
+            Agent.update(mine, &[%{target: target, from: from, content: content} | &1])
+            Agent.get(gate, & &1)
+          end
+        }
+      )
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["alerts"] == 0
+    assert length(Agent.get(mine, & &1)) == 1
+    assert Map.get(state.seen_periods, "wingston", MapSet.new()) == MapSet.new()
+
+    Agent.update(gate, fn _ -> :ok end)
+    advance(clock, 60_000)
+    {_reply, state} = decode_reply(tick(state))
+
+    # the whole batch (one card, here) was retried and now delivered.
+    assert length(Agent.get(mine, & &1)) == 2
+    assert state.seen_periods["wingston"] == MapSet.new(["2026-07-01"])
+
+    # a third tick has nothing new to say — no further send.
+    advance(clock, 60_000)
+    {_reply, _state} = decode_reply(tick(state))
+    assert length(Agent.get(mine, & &1)) == 2
+  end
+
+  test "two swarms ticked together: a failing sender for one leaves only the other's periods marked seen" do
+    envelope_a = topics_envelope("alpha", "2026-07-01")
+    envelope_b = topics_envelope("beta", "2026-07-01")
+
+    {:ok, fake} =
+      Client.Fake.start_link(%{
+        "alpha" => %{dashboard: {:ok, envelope_a}, events: {:ok, []}},
+        "beta" => %{dashboard: {:ok, envelope_b}, events: {:ok, []}}
+      })
+
+    {:ok, clock} = Agent.start_link(fn -> @t0 end)
+    {:ok, mine} = Agent.start_link(fn -> [] end)
+
+    config = %{
+      swarm_name: "observer",
+      registry: %{
+        "alpha" => %{dashboard_url: "http://a.example", token_env: nil, repo: nil},
+        "beta" => %{dashboard_url: "http://b.example", token_env: nil, repo: nil}
+      },
+      tick_sources: ["cron"],
+      read_sources: [],
+      alert_conversation_id: "tg:42:0",
+      client: Client.Fake,
+      client_opts: [fake: fake],
+      store_mod: NullStore,
+      now_fn: fn -> Agent.get(clock, & &1) end,
+      deliver_fn: fn target, from, content ->
+        Agent.update(mine, &[%{target: target, from: from, content: content} | &1])
+        if String.contains?(content, "alpha"), do: {:error, :boom}, else: :ok
+      end
+    }
+
+    {:ok, state} = Scope.init(config)
+    {reply, state} = decode_reply(tick(state))
+    assert reply["alerts"] == 0
+
+    assert length(Agent.get(mine, & &1)) == 2
+    assert Map.get(state.seen_periods, "alpha", MapSet.new()) == MapSet.new()
+    assert state.seen_periods["beta"] == MapSet.new(["2026-07-01"])
   end
 end
