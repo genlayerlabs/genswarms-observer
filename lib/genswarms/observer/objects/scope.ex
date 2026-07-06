@@ -498,13 +498,13 @@ defmodule Genswarms.Observer.Objects.Scope do
         # from one detect/2 would both pass it and both deliver.
         deduped = passed |> Enum.reverse() |> Enum.uniq_by(&alert_key/1)
 
-        budgeted = apply_alert_budget(deduped, swarm, now)
+        {budgeted, coalesced_suppressed} = apply_alert_budget(st, deduped, swarm, now)
 
         st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry, now) end)
 
         st = deliver_digest(st, swarm, data, now)
 
-        {st, fired + length(budgeted), supp}
+        {st, fired + length(budgeted), supp + coalesced_suppressed}
       end)
 
     state = %{state | last_tick_ms: now}
@@ -619,10 +619,14 @@ defmodule Genswarms.Observer.Objects.Scope do
   # Caps how many cards one tick can emit for one swarm: a misbehaving
   # swarm firing many distinct alert types in one tick must not flood
   # :sender. Overflow collapses into one synthetic summary alert instead
-  # of being silently dropped.
-  defp apply_alert_budget(alerts, swarm, now_ms) do
+  # of being silently dropped. Returns `{alerts_to_emit, suppressed}`:
+  # the summary goes through the SAME `cooled_down?` gate as any other
+  # alert (its key is `{swarm, :alerts_coalesced}`, stamped into
+  # `last_alert` by `emit_alert/4` like everyone else's), so sustained
+  # overflow summarizes once per cooldown window — not once per tick.
+  defp apply_alert_budget(state, alerts, swarm, now_ms) do
     if length(alerts) <= @alert_budget_per_swarm do
-      alerts
+      {alerts, 0}
     else
       {kept, dropped} = Enum.split(alerts, @alert_budget_per_swarm)
 
@@ -641,7 +645,11 @@ defmodule Genswarms.Observer.Objects.Scope do
         cids: []
       }
 
-      kept ++ [coalesced]
+      if cooled_down?(state, coalesced, now_ms) do
+        {kept ++ [coalesced], 0}
+      else
+        {kept, 1}
+      end
     end
   end
 

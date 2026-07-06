@@ -402,6 +402,49 @@ defmodule Genswarms.Observer.ScopeTest do
     assert evidence_text =~ "synthetic_8"
   end
 
+  test "sustained overflow: the coalesced summary respects its own cooldown across ticks" do
+    defmodule FloodDetector do
+      @behaviour Genswarms.Observer.Detector
+
+      # 8 fresh-keyed alerts EVERY tick (keys carry a tick counter, so
+      # cooldown never filters the individual alerts) — sustained overflow.
+      def detect(_fetched, ctx) do
+        tick_n = ctx.state || 0
+
+        alerts =
+          for i <- 1..8 do
+            %{
+              type: :flood,
+              key: {ctx.swarm, :flood, tick_n, i},
+              swarm: ctx.swarm,
+              at_ms: ctx.now_ms,
+              summary: "flood #{tick_n}/#{i}",
+              evidence: %{}
+            }
+          end
+
+        {alerts, tick_n + 1}
+      end
+    end
+
+    %{state: state, outbox: outbox, clock: clock} = start_scope()
+    state = %{state | detectors: [FloodDetector]}
+
+    {reply1, state} = decode_reply(tick(state))
+    # 6 kept + the coalesced summary
+    assert reply1["alerts"] == 7
+
+    advance(clock, 60_000)
+    {reply2, _state} = decode_reply(tick(state))
+    # 6 fresh kept alerts, but the summary is inside its cooldown window:
+    # suppressed like any other same-key alert, not re-emitted every tick
+    assert reply2["alerts"] == 6
+    assert reply2["suppressed"] == 1
+
+    cards = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+    assert Enum.count(cards, &(&1["card"]["title"] =~ "alerts_coalesced")) == 1
+  end
+
   test "two same-key alerts in one tick collapse into a single card" do
     defmodule DupKeyDetector do
       @behaviour Genswarms.Observer.Detector
