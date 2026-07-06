@@ -42,9 +42,10 @@ defmodule Genswarms.Observer.Digest do
   scrubbing rules wingston applies at the source (NFC normalize, strip
   bidi/control/zero-width/format chars, remove URL/email/@handle
   fragments and 6+-digit runs, collapse whitespace, cap at 80) — defense
-  in depth against a compromised or buggy upstream. It also escapes
-  Telegram MarkdownV2 metacharacters, since digest cards may render with
-  `parse_mode` set.
+  in depth against a compromised or buggy upstream. It deliberately does
+  NO markup escaping: cards render as HTML at the telegram sender, which
+  escapes `& < > "` itself — escaping here (MarkdownV2 or HTML) would
+  just put literal escape sequences into every card.
   """
 
   @period_re ~r/^\d{4}-\d{2}-\d{2}$/
@@ -66,31 +67,6 @@ defmodule Genswarms.Observer.Digest do
     ~r/@\w{3,}/u,
     ~r/\+?\d[\d\s().-]{6,}\d/u,
     ~r/\d{6,}/u
-  ]
-
-  # "\\" MUST be first: existing backslashes are escaped before any other
-  # metachar gains one, otherwise an input `\*` sanitizes into `\\*` —
-  # MarkdownV2 reads that as literal-backslash + UNESCAPED star.
-  @markdown_escape_chars [
-    "\\",
-    "_",
-    "*",
-    "[",
-    "]",
-    "(",
-    ")",
-    "~",
-    "`",
-    ">",
-    "#",
-    "+",
-    "-",
-    "=",
-    "|",
-    "{",
-    "}",
-    ".",
-    "!"
   ]
 
   @doc """
@@ -237,7 +213,7 @@ defmodule Genswarms.Observer.Digest do
   end
 
   defp full_card(swarm, coverage, period) do
-    title = "📊 digest: #{escape_markdown(swarm)} · #{period["period_id"]}"
+    title = "📊 digest: #{swarm} · #{period["period_id"]}"
 
     blocks =
       if period["status"] == "error_redacted" do
@@ -332,7 +308,7 @@ defmodule Genswarms.Observer.Digest do
     total_turns = sum_counts(older, "turns")
 
     %{
-      "title" => "📊 digest: #{escape_markdown(swarm)} · missed #{n} periods",
+      "title" => "📊 digest: #{swarm} · missed #{n} periods",
       "blocks" => [
         %{"kind" => "paragraph", "text" => range_text},
         %{
@@ -362,8 +338,8 @@ defmodule Genswarms.Observer.Digest do
   scrub structured PII (URLs, emails, @handles, phone-shaped and bare 6+
   digit runs), repeat the strip+scrub pass a second time (belt and braces
   against reassembly), collapse whitespace, trim, cap at #{@label_cap}
-  chars, then escape Telegram MarkdownV2 metacharacters. Non-binary input
-  sanitizes to `""`.
+  chars. No markup escaping — the sender renders cards as HTML and does
+  its own `& < > "` escaping. Non-binary input sanitizes to `""`.
   """
   @spec sanitize_label(term) :: String.t()
   def sanitize_label(s) when is_binary(s) do
@@ -376,7 +352,6 @@ defmodule Genswarms.Observer.Digest do
     |> String.replace(~r/\s+/u, " ")
     |> String.trim()
     |> String.slice(0, @label_cap)
-    |> escape_markdown()
   end
 
   def sanitize_label(_), do: ""
@@ -384,10 +359,4 @@ defmodule Genswarms.Observer.Digest do
   defp strip_invisibles(s), do: String.replace(s, @strip_chars, "")
 
   defp scrub_pii(s), do: Enum.reduce(@pii_patterns, s, &Regex.replace(&1, &2, ""))
-
-  defp escape_markdown(s) do
-    Enum.reduce(@markdown_escape_chars, s, fn char, acc ->
-      String.replace(acc, char, "\\" <> char)
-    end)
-  end
 end

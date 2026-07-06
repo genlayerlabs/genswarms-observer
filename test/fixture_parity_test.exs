@@ -71,15 +71,16 @@ defmodule Genswarms.Observer.FixtureParityTest do
     assert topics_text =~ "• contact about payouts (2)"
     assert topics_text =~ "• call for support (2)"
     assert topics_text =~ "• verify at now (2)"
-    # markdown metachars survive the producer; the observer escapes at render
-    assert topics_text =~ "• pricing \\*volume\\* \\[discounts\\] (3)"
+    # markdown metachars survive producer AND observer as plain text —
+    # the sender renders cards as HTML and does its own escaping
+    assert topics_text =~ "• pricing *volume* [discounts] (3)"
     refute topics_text =~ "wallet linking errors"
     refute topics_text =~ "http"
     refute topics_text =~ "@wingston_admin"
     refute topics_text =~ "555"
 
     signals_text = Enum.find(texts, &String.starts_with?(&1, "signals:"))
-    assert signals_text == "signals: frustration (3), churn\\_risk (2)"
+    assert signals_text == "signals: frustration (3), churn_risk (2)"
   end
 
   test "decode_health/1 reads the producer envelope as :ok" do

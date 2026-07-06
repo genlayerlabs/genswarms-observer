@@ -230,10 +230,8 @@ defmodule Genswarms.Observer.DigestTest do
 
     line = texts(full) |> Enum.find(&String.starts_with?(&1, "coverage:"))
     refute line =~ <<0x202E::utf8>>
-    assert line =~ "\\*"
-    assert line =~ "\\_"
-    assert line =~ "\\["
-    assert line =~ "\\]"
+    # markup chars are plain text (sender renders HTML and escapes itself)
+    assert line == "coverage: xy*_[inj]"
   end
 
   # ── topics / signals rendering ───────────────────────────────────────────
@@ -335,40 +333,21 @@ defmodule Genswarms.Observer.DigestTest do
       assert String.length(result) <= 80
     end
 
-    test "escapes Telegram MarkdownV2 metacharacters" do
-      out = Digest.sanitize_label("hello_world *bold* [link](url) ~tilde~ `code` #tag")
-      assert out =~ "\\_"
-      assert out =~ "\\*"
-      assert out =~ "\\["
-      assert out =~ "\\]"
-      assert out =~ "\\("
-      assert out =~ "\\)"
-      assert out =~ "\\~"
-      assert out =~ "\\`"
-      assert out =~ "\\#"
+    test "markup metacharacters pass through unescaped — cards render as HTML at the sender" do
+      # The telegram sender's card renderer emits HTML and does its own
+      # `& < > "` escaping; MarkdownV2 backslash-escaping here would show
+      # up as literal visible backslashes in every digest card. Security
+      # scrubs (PII, invisibles) still apply — but markup chars are just
+      # text.
+      label = "hello_world *bold* [link] ~tilde~ `code` #tag"
+      assert Digest.sanitize_label(label) == label
+      refute Digest.sanitize_label(label) =~ "\\"
     end
 
-    test "an input backslash cannot defeat MarkdownV2 escaping of *" do
-      # Input is the 3 chars `\*x`. Backslash must be escaped FIRST: the
-      # literal backslash doubles (`\\`), then the star gets its own escape
-      # (`\*`) — output `\\\*x`. Without backslash-first, output would be
-      # `\\*x`, which MarkdownV2 parses as literal-`\` + UNESCAPED `*`.
-      out = Digest.sanitize_label("\\*x")
-      assert out == "\\\\\\*x"
-
-      # every * in the output is escaped: walking escape pairs left to
-      # right, no * survives as a bare metacharacter.
-      unescaped_star? =
-        out
-        |> String.graphemes()
-        |> Enum.reduce({false, false}, fn
-          "\\", {false, hit} -> {true, hit}
-          "*", {false, _hit} -> {false, true}
-          _g, {_esc, hit} -> {false, hit}
-        end)
-        |> elem(1)
-
-      refute unescaped_star?
+    test "an input backslash is preserved verbatim, never doubled" do
+      # Input is the 3 chars `\*x` — with no MarkdownV2 escaping applied,
+      # the label reaches the card exactly as written.
+      assert Digest.sanitize_label("\\*x") == "\\*x"
     end
 
     test "non-binary input sanitizes to empty string without crashing" do
