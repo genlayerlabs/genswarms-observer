@@ -425,7 +425,9 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       f = fetched(events)
       ctx = %{swarm: "w", thresholds: @thresholds, state: nil, now_ms: 10_000}
 
-      assert {[], nil} = DeliveryFailureBurst.detect(f, ctx)
+      # below threshold raises nothing, but the failure is now REMEMBERED
+      # (accumulate-and-prune state) for the cross-tick window
+      assert {[], %{fail_ts: %{"tg:2:0" => [0]}}} = DeliveryFailureBurst.detect(f, ctx)
     end
 
     test "events outside the window are excluded from the count" do
@@ -437,7 +439,9 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       f = fetched(events)
       ctx = %{swarm: "w", thresholds: @thresholds, state: nil, now_ms: 300_000}
 
-      assert {[], nil} = DeliveryFailureBurst.detect(f, ctx)
+      # the out-of-window failure is pruned at ingest, not merely not-counted
+      assert {[], %{fail_ts: %{"tg:2:0" => kept}}} = DeliveryFailureBurst.detect(f, ctx)
+      assert length(kept) == 2
     end
 
     test "default_thresholds exposes only its namespaced keys" do
@@ -468,6 +472,95 @@ defmodule Genswarms.Observer.DetectorsUxTest do
           ] do
         assert {[], :prior} = DeliveryFailureBurst.detect(feedless, ctx)
       end
+    end
+
+    # ── cross-tick accumulation (the feed is INCREMENTAL: Scope's cursor
+    # advances every tick, so each detect/2 sees only the events since the
+    # last tick — a stateless recompute is blind to any burst spread across
+    # ticks; the detector must accumulate + prune in ctx.state) ──────────────
+
+    defp burst_tick(state, events, now_ms) do
+      ctx = %{swarm: "w", thresholds: @thresholds, state: state, now_ms: now_ms}
+      DeliveryFailureBurst.detect(fetched(events), ctx)
+    end
+
+    test "a burst spread across three ticks (one failure per tick) fires on the third" do
+      fail = fn ms -> ev("reply_sent", "tg:2:0", ms, %{"ok" => false}) end
+
+      {[], s1} = burst_tick(nil, [fail.(0)], 10_000)
+      {[], s2} = burst_tick(s1, [fail.(100_000)], 110_000)
+      {alerts, _s3} = burst_tick(s2, [fail.(200_000)], 210_000)
+
+      assert [
+               %{
+                 type: :delivery_failure_burst,
+                 cids: ["tg:2:0"],
+                 key: {"w", :delivery_failure_burst, "tg:2:0"},
+                 evidence: %{"cid" => "tg:2:0", "count" => 3, "window_s" => 600}
+               }
+             ] = alerts
+    end
+
+    test "accumulated failures age out: a later tick past the window sees them pruned, no alert" do
+      fail = fn ms -> ev("reply_sent", "tg:2:0", ms, %{"ok" => false}) end
+
+      {[], s1} = burst_tick(nil, [fail.(0)], 10_000)
+      {[], s2} = burst_tick(s1, [fail.(100_000)], 110_000)
+      {[_alert], s3} = burst_tick(s2, [fail.(200_000)], 210_000)
+
+      # a window+ later the three old failures are outside the window — one
+      # NEW failure alone must not ride the stale accumulation into an alert
+      later = 200_000 + 600_000 + 60_000
+      assert {[], s4} = burst_tick(s3, [fail.(later)], later + 1_000)
+
+      # and the pruned cids are gone from state (no unbounded accumulation)
+      assert [_] = s4.fail_ts |> Map.fetch!("tg:2:0")
+    end
+
+    test "reply_failed events accumulate across ticks into :reply_failed_burst" do
+      rf = fn ms -> %{"kind" => "reply_failed", "from" => "agent_3", "seq" => 1, "ts" => ts(ms)} end
+
+      {[], s1} = burst_tick(nil, [rf.(0)], 10_000)
+      {[], s2} = burst_tick(s1, [rf.(100_000)], 110_000)
+      {alerts, _s3} = burst_tick(s2, [rf.(200_000)], 210_000)
+
+      assert [%{type: :reply_failed_burst}] = alerts
+    end
+
+    test "a feed outage mid-burst preserves the accumulated failures" do
+      fail = fn ms -> ev("reply_sent", "tg:2:0", ms, %{"ok" => false}) end
+
+      {[], s1} = burst_tick(nil, [fail.(0), fail.(50_000)], 60_000)
+
+      outage = %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: :unavailable}
+      ctx = %{swarm: "w", thresholds: @thresholds, state: s1, now_ms: 120_000}
+      {[], s2} = DeliveryFailureBurst.detect(outage, ctx)
+
+      {alerts, _s3} = burst_tick(s2, [fail.(200_000)], 210_000)
+      assert [%{type: :delivery_failure_burst}] = alerts
+    end
+
+    test "a replayed event (same cid + ts, observer-restart ring replay) never double-counts" do
+      # det state is PERSISTED across observer restarts (Scope's store) while
+      # the feed cursor is session-local — a restart replays the ring into
+      # state that already counted those failures. 2 real failures must stay
+      # 2, not become 4 and cross the threshold falsely.
+      fail = fn ms -> ev("reply_sent", "tg:2:0", ms, %{"ok" => false}) end
+
+      {[], s1} = burst_tick(nil, [fail.(0), fail.(50_000)], 60_000)
+      # restart: the same two events replay in one batch
+      assert {[], s2} = burst_tick(s1, [fail.(0), fail.(50_000)], 70_000)
+      assert s2.fail_ts |> Map.fetch!("tg:2:0") |> length() == 2
+    end
+
+    test "dropped cids whose window emptied do not linger in state" do
+      fail = fn ms -> ev("reply_sent", "tg:9:9", ms, %{"ok" => false}) end
+
+      {[], s1} = burst_tick(nil, [fail.(0)], 10_000)
+      assert Map.has_key?(s1.fail_ts, "tg:9:9")
+
+      {[], s2} = burst_tick(s1, [], 0 + 600_000 + 60_000)
+      refute Map.has_key?(s2.fail_ts, "tg:9:9")
     end
   end
 

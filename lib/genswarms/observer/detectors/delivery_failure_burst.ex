@@ -6,10 +6,12 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     false` for the SAME cid inside `"delivery_failure.window_s"` seconds ->
     `:delivery_failure_burst`, keyed `{swarm, :delivery_failure_burst, cid}`
     with `cids: [cid]` so the swarm-level cooldown (Scope) dedupes repeats
-    across ticks instead of this detector tracking its own history.
-  - Swarm-level: `>= "delivery_failure.count"` `reply_failed` events (no
-    `cid` — a `reply_sent` NOT tied to any request) inside the same window
-    -> `:reply_failed_burst`, no cids.
+    across ticks.
+  - Swarm-level: `>= "delivery_failure.count"` `reply_failed` events inside
+    the same window -> `:reply_failed_burst`, no cids. On wingston a
+    `reply_failed` never carries a cid (the target could not be resolved);
+    on micromarkets it sometimes does — either way it is counted at swarm
+    level and any cid is ignored.
 
   Consumes `fetched.feed` (`GET /api/swarms/:name/events/feed`) — the only
   surface carrying `reply_sent`/`reply_failed`. Real wire shape (identical
@@ -19,14 +21,31 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
   micromarkets `dashboard/feed/event_feed.ex:317-329` (`"ts"` via `:479-480`).
 
   A missing `"ok"` on `reply_sent` counts as delivered (does not count
-  towards the burst). `"kind"` names the event on both wires.
+  towards the burst). `"kind"` names the event on both wires. Events with
+  a non-number `"ts"` are skipped — they cannot participate in a time
+  window.
+
+  STATEFUL — the feed is INCREMENTAL: Scope's session cursor advances every
+  tick, so each `detect/2` sees only the events since the last tick. A
+  stateless recompute would be blind to any burst spread across ticks
+  (3 failures one minute apart, ticked minutely, would never fire). So the
+  detector accumulates failure timestamps in `ctx.state` and prunes them to
+  the alert window every tick:
+
+      %{fail_ts: %{cid => [ts_ms]}, reply_failed_ts: [ts_ms]}
+
+  Pruning to exactly the window bounds state growth (a failure ages out at
+  the alert horizon — beyond it, it can never contribute to an alert), and
+  cids whose list empties are dropped entirely (no unbounded cid
+  accumulation). Appends are deduped by exact `ts_ms` per list: `det` state
+  is PERSISTED across observer restarts (Scope's store) while the feed
+  cursor is session-local, so a restart replays the host's ring into state
+  that already counted those failures — without the dedupe, 2 real failures
+  would replay into 4 and cross the threshold falsely.
 
   `feed` `:unavailable` / `{:error, _}` / absent is a no-op with prior
-  state — no window, no verdict.
-
-  Stateless: recomputed fresh from the fetched event window every tick, so
-  `ctx.state` passes through unchanged. Window filtering is count-based and
-  order-insensitive, so unlike `Unanswered` no defensive sort is needed.
+  state — no window, no verdict, nothing ages out (the missed window is
+  re-read next tick: Scope leaves the cursor untouched on those answers).
   """
 
   @behaviour Genswarms.Observer.Detector
@@ -36,7 +55,7 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     do: %{"delivery_failure.count" => 3, "delivery_failure.window_s" => 600}
 
   @impl true
-  def init, do: nil
+  def init, do: empty_state()
 
   @impl true
   def detect(fetched, ctx) do
@@ -46,14 +65,18 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
         window_s = ctx.thresholds["delivery_failure.window_s"]
         window_ms = window_s * 1_000
 
-        recent = Enum.filter(events, &within_window?(&1, ctx.now_ms, window_ms))
+        state =
+          ctx.state
+          |> normalize_state()
+          |> ingest(events)
+          |> prune(ctx.now_ms, window_ms)
 
-        cid_alerts = cid_burst_alerts(recent, ctx.swarm, ctx.now_ms, count_threshold, window_s)
+        cid_alerts = cid_burst_alerts(state, ctx.swarm, ctx.now_ms, count_threshold, window_s)
 
         swarm_alerts =
-          reply_failed_burst_alerts(recent, ctx.swarm, ctx.now_ms, count_threshold, window_s)
+          reply_failed_burst_alerts(state, ctx.swarm, ctx.now_ms, count_threshold, window_s)
 
-        {cid_alerts ++ swarm_alerts, ctx.state}
+        {cid_alerts ++ swarm_alerts, state}
 
       # :unavailable / {:error, _} / no :feed key — no window, no verdict.
       _ ->
@@ -61,25 +84,78 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     end
   end
 
-  defp within_window?(ev, now_ms, window_ms) do
-    case event_ms(ev) do
-      nil -> false
-      ms -> now_ms - ms <= window_ms
-    end
+  defp empty_state, do: %{fail_ts: %{}, reply_failed_ts: []}
+
+  # Prior state may be nil (pre-stateful init, or a fresh DetectorRunner
+  # default) or malformed (a poisoned store entry) — restart clean rather
+  # than crash the tick.
+  defp normalize_state(%{fail_ts: fail_ts, reply_failed_ts: rf})
+       when is_map(fail_ts) and is_list(rf),
+       do: %{fail_ts: fail_ts, reply_failed_ts: rf}
+
+  defp normalize_state(_), do: empty_state()
+
+  defp ingest(state, events) do
+    Enum.reduce(events, state, fn ev, st ->
+      case event_ms(ev) do
+        # non-number ts: skipped — it cannot sit in a time window
+        nil ->
+          st
+
+        ms ->
+          cond do
+            failed_reply_sent?(ev) ->
+              cid = ev["cid"]
+              update_in(st.fail_ts[cid], &append_dedup(&1, ms))
+
+            kind(ev) == "reply_failed" ->
+              %{st | reply_failed_ts: append_dedup(st.reply_failed_ts, ms)}
+
+            true ->
+              st
+          end
+      end
+    end)
   end
 
-  defp cid_burst_alerts(events, swarm, now_ms, count_threshold, window_s) do
-    events
-    |> Enum.filter(&failed_reply_sent?/1)
-    |> Enum.group_by(& &1["cid"])
-    |> Enum.filter(fn {_cid, evs} -> length(evs) >= count_threshold end)
-    |> Enum.map(fn {cid, evs} ->
+  # Exact-ts dedupe: restart ring replays re-deliver events already counted
+  # into persisted state (see moduledoc). Two DISTINCT failures for one cid
+  # in the same millisecond do not happen on either wire (the sender is
+  # serial per conversation).
+  defp append_dedup(nil, ms), do: [ms]
+  defp append_dedup(list, ms), do: if(ms in list, do: list, else: [ms | list])
+
+  defp prune(state, now_ms, window_ms) do
+    fail_ts =
+      state.fail_ts
+      |> Enum.flat_map(fn {cid, ts_list} ->
+        case prune_list(ts_list, now_ms, window_ms) do
+          [] -> []
+          kept -> [{cid, kept}]
+        end
+      end)
+      |> Map.new()
+
+    %{
+      state
+      | fail_ts: fail_ts,
+        reply_failed_ts: prune_list(state.reply_failed_ts, now_ms, window_ms)
+    }
+  end
+
+  defp prune_list(ts_list, now_ms, window_ms),
+    do: Enum.filter(ts_list, &(now_ms - &1 <= window_ms))
+
+  defp cid_burst_alerts(state, swarm, now_ms, count_threshold, window_s) do
+    state.fail_ts
+    |> Enum.filter(fn {_cid, ts_list} -> length(ts_list) >= count_threshold end)
+    |> Enum.map(fn {cid, ts_list} ->
       %{
         type: :delivery_failure_burst,
         swarm: swarm,
         at_ms: now_ms,
-        summary: "#{length(evs)} failed reply deliveries for #{cid} in #{window_s}s",
-        evidence: %{"cid" => cid, "count" => length(evs), "window_s" => window_s},
+        summary: "#{length(ts_list)} failed reply deliveries for #{cid} in #{window_s}s",
+        evidence: %{"cid" => cid, "count" => length(ts_list), "window_s" => window_s},
         key: {swarm, :delivery_failure_burst, cid},
         cids: [cid]
       }
@@ -89,17 +165,17 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
   defp failed_reply_sent?(ev),
     do: kind(ev) == "reply_sent" and is_binary(ev["cid"]) and Map.get(ev, "ok", true) == false
 
-  defp reply_failed_burst_alerts(events, swarm, now_ms, count_threshold, window_s) do
-    failures = Enum.filter(events, &(kind(&1) == "reply_failed"))
+  defp reply_failed_burst_alerts(state, swarm, now_ms, count_threshold, window_s) do
+    count = length(state.reply_failed_ts)
 
-    if length(failures) >= count_threshold do
+    if count >= count_threshold do
       [
         %{
           type: :reply_failed_burst,
           swarm: swarm,
           at_ms: now_ms,
-          summary: "#{length(failures)} reply_failed events in #{window_s}s",
-          evidence: %{"count" => length(failures), "window_s" => window_s}
+          summary: "#{count} reply_failed events in #{window_s}s",
+          evidence: %{"count" => count, "window_s" => window_s}
         }
       ]
     else
