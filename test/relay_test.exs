@@ -290,6 +290,54 @@ defmodule Genswarms.Observer.RelayTest do
     assert Jason.decode!(json)["ok"] == true
   end
 
+  test "delete-on-emit: a re-alerting key reclaims its relay budget even while the OLD alert instance is still live" do
+    # The Map.take prune only fires when the old alert SCROLLS OUT of
+    # state.alerts (cap 50) — in a quiet system an exhausted alert lingers
+    # there for days, so a legitimately re-alerting same key (cooldown long
+    # passed) would inherit the exhausted count and get 0 diagnosis reads.
+    # A fresh emit already passed cooldown: it is a new instance and must
+    # start its budget clean.
+    key = {"wingston", :unanswered, "tg:1:0"}
+    open = %{"kind" => "request_open", "cid" => "tg:1:0", "seq" => 1, "ts" => (@t0 - 20 * 60_000) / 1000}
+
+    healthy_dashboard = %{
+      "swarm" => "wingston",
+      "status" => "running",
+      "summary" => %{"pool" => %{"leased" => 0, "size" => 4}},
+      "nodes" => [%{"name" => "worker", "type" => "agent", "state" => "idle"}],
+      "sessions" => [],
+      "warnings" => []
+    }
+
+    %{state: state} =
+      start_scope(
+        fixture: %{
+          "wingston" => %{
+            dashboard: {:ok, healthy_dashboard},
+            events: {:ok, []},
+            events_feed: {:ok, %{events: [open], seq: 1}},
+            session_history: %{"tg:1:0" => {:ok, %{"turns" => []}}}
+          }
+        },
+        config: %{deliver_fn: fn _target, _from, _content -> :ok end}
+      )
+
+    # a previous same-key alert instance exhausted its 3-relay budget and is
+    # STILL in state.alerts (quiet system — nothing scrolled it out)
+    state = %{state | alerts: [alert(%{})], relay_counts: %{key => 3}}
+
+    # the same key re-alerts: the tick's feed drives Unanswered to a fresh
+    # same-key emit (last_alert is empty, so cooldown passes)
+    {:reply, _json, state} = Scope.handle_message(:cron, ~s({"action":"tick"}), state)
+    assert Enum.count(state.alerts, &(Map.get(&1, :key) == key)) == 2
+
+    # the emit cleared the stale count — the fresh instance starts clean
+    refute Map.has_key?(state.relay_counts, key)
+
+    {:reply, json, _state} = ask(state, "wingston", "tg:1:0")
+    assert Jason.decode!(json)["ok"] == true
+  end
+
   # ── trust gate ─────────────────────────────────────────────────────────────
 
   test "untrusted from is dropped silently — never reaches the relay logic" do

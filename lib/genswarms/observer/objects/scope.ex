@@ -931,13 +931,21 @@ defmodule Genswarms.Observer.Objects.Scope do
       state
       | last_alert: Map.put(state.last_alert, alert_key(alert), alert.at_ms),
         alerts: alerts,
-        # Relay budgets live only as long as their alert: prune counts down
-        # to the keys still present in the (just-trimmed) alerts list. A
-        # key whose alert scrolled out here starts from a clean count when
-        # a fresh same-key alert emits later — a conversation that
-        # legitimately re-alerts is never starved by an exhausted budget
-        # inherited from a long-gone alert instance.
-        relay_counts: Map.take(state.relay_counts, Enum.map(alerts, &alert_key/1))
+        # Relay budgets live only as long as their alert INSTANCE. Two
+        # prunes, both needed:
+        # - delete-on-emit: THIS alert already passed cooldown, so it is a
+        #   fresh instance and starts its budget clean. Without it, an
+        #   exhausted same-key alert lingering in `alerts` (quiet system —
+        #   the cap-50 trim may not scroll it out for days) would bequeath
+        #   its spent count to the re-alert and starve it of diagnosis
+        #   reads. Bounded: at most #{@relay_budget_per_alert} reads per
+        #   cooldown window, since only a cooled-down key can re-emit.
+        # - Map.take: counts whose alert scrolled out of the just-trimmed
+        #   list die with it, so the map never outgrows `alerts`.
+        relay_counts:
+          state.relay_counts
+          |> Map.delete(alert_key(alert))
+          |> Map.take(Enum.map(alerts, &alert_key/1))
     }
   end
 
