@@ -387,7 +387,8 @@ defmodule Genswarms.Observer.Objects.Scope do
           do: read_remote(:events, swarm, state),
           else: drop(from, "get_events", state)
 
-      {:ok, %{"action" => "get_session_history", "swarm" => swarm, "cid" => cid}} ->
+      {:ok, %{"action" => "get_session_history", "swarm" => swarm, "cid" => cid}}
+      when is_binary(cid) ->
         if trusted?(from, state.read_sources),
           do: relay_session_history(from, swarm, cid, state),
           else: drop(from, "get_session_history", state)
@@ -453,7 +454,12 @@ defmodule Genswarms.Observer.Objects.Scope do
             end
           end)
 
-        budgeted = apply_alert_budget(Enum.reverse(passed), swarm, now)
+        # Same-key dedupe WITHIN the tick: cooldown above compares against
+        # pre-emit last_alert for the whole batch, so two same-key alerts
+        # from one detect/2 would both pass it and both deliver.
+        deduped = passed |> Enum.reverse() |> Enum.uniq_by(&alert_key/1)
+
+        budgeted = apply_alert_budget(deduped, swarm, now)
 
         st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry, now) end)
 

@@ -284,6 +284,35 @@ defmodule Genswarms.Observer.ScopeTest do
     assert evidence_text =~ "synthetic_8"
   end
 
+  test "two same-key alerts in one tick collapse into a single card" do
+    defmodule DupKeyDetector do
+      @behaviour Genswarms.Observer.Detector
+
+      def detect(_fetched, ctx) do
+        alert = %{
+          type: :dup_thing,
+          swarm: ctx.swarm,
+          at_ms: ctx.now_ms,
+          summary: "same key twice in one detect",
+          evidence: %{}
+        }
+
+        # identical key (default {swarm, type}) — cooldown can't catch this
+        # within a tick because last_alert only updates on emit.
+        {[alert, alert], ctx.state}
+      end
+    end
+
+    %{state: state, outbox: outbox} = start_scope()
+    state = %{state | detectors: [DupKeyDetector]}
+
+    {reply, _state} = decode_reply(tick(state))
+    assert reply["alerts"] == 1
+
+    assert [delivery] = sent(outbox)
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "dup_thing"
+  end
+
   # ── escalation (fase 3) ───────────────────────────────────────────────────
 
   test "with escalate_to set, an emitted alert also becomes a diagnosis task" do
@@ -366,6 +395,17 @@ defmodule Genswarms.Observer.ScopeTest do
       Scope.handle_message(:diagnostico, ~s({"action":"get_events","swarm":"wingston"}), state)
 
     assert %{"ok" => true, "events" => [%{"id" => 1}]} = Jason.decode!(json)
+  end
+
+  test "get_session_history with a non-binary cid is dropped, never crashes" do
+    %{state: state, fake: fake} = start_scope()
+
+    for bad_cid <- [%{}, [1, 2], 7, nil, true] do
+      msg = Jason.encode!(%{action: "get_session_history", swarm: "wingston", cid: bad_cid})
+      assert {:noreply, _} = Scope.handle_message(:diagnostico, msg, state)
+    end
+
+    assert Client.Fake.calls(fake) == []
   end
 
   test "reads on an unobserved swarm answer an error, never fetch" do

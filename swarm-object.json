@@ -28,7 +28,7 @@
       "thresholds": {
         "type": "object",
         "x-mutable": true,
-        "description": "Detector tuning overrides: stall_minutes (10), error_burst_count (5), error_burst_window_s (60), pool_saturated_s (120)."
+        "description": "Detector tuning overrides: stall_minutes (10), error_burst_count (5), error_burst_window_s (60), pool_saturated_s (120), unanswered.minutes (15), delivery_failure.count (3), delivery_failure.window_s (600), topics_stale.periods (1), plus each custom detector's default_thresholds/0 keys."
       },
       "cooldown_minutes": {
         "type": "integer",
@@ -77,6 +77,14 @@
       "client": {
         "type": "string",
         "description": "Client adapter module (default Genswarms.Observer.Client.Http)."
+      },
+      "store_mod": {
+        "type": "string",
+        "description": "Durability store module (default Genswarms.Observer.Store.InMemory). Boot-only module reference — same trust class as client, never x-mutable."
+      },
+      "save_seq": {
+        "type": "integer",
+        "description": "Host-provided restart watermark for rollback detection: a caller that kept the last persisted save_seq across a restart passes it in; loading an older store fires a store_rollback alert. Boot-only."
       },
       "client_opts": {
         "type": "array",

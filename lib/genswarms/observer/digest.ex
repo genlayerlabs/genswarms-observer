@@ -68,7 +68,11 @@ defmodule Genswarms.Observer.Digest do
     ~r/\d{6,}/u
   ]
 
+  # "\\" MUST be first: existing backslashes are escaped before any other
+  # metachar gains one, otherwise an input `\*` sanitizes into `\\*` —
+  # MarkdownV2 reads that as literal-backslash + UNESCAPED star.
   @markdown_escape_chars [
+    "\\",
     "_",
     "*",
     "[",

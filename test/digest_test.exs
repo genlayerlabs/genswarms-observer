@@ -348,6 +348,29 @@ defmodule Genswarms.Observer.DigestTest do
       assert out =~ "\\#"
     end
 
+    test "an input backslash cannot defeat MarkdownV2 escaping of *" do
+      # Input is the 3 chars `\*x`. Backslash must be escaped FIRST: the
+      # literal backslash doubles (`\\`), then the star gets its own escape
+      # (`\*`) — output `\\\*x`. Without backslash-first, output would be
+      # `\\*x`, which MarkdownV2 parses as literal-`\` + UNESCAPED `*`.
+      out = Digest.sanitize_label("\\*x")
+      assert out == "\\\\\\*x"
+
+      # every * in the output is escaped: walking escape pairs left to
+      # right, no * survives as a bare metacharacter.
+      unescaped_star? =
+        out
+        |> String.graphemes()
+        |> Enum.reduce({false, false}, fn
+          "\\", {false, hit} -> {true, hit}
+          "*", {false, _hit} -> {false, true}
+          _g, {_esc, hit} -> {false, hit}
+        end)
+        |> elem(1)
+
+      refute unescaped_star?
+    end
+
     test "non-binary input sanitizes to empty string without crashing" do
       assert Digest.sanitize_label(nil) == ""
       assert Digest.sanitize_label(42) == ""
