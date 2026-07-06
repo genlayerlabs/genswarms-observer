@@ -334,6 +334,140 @@ defmodule Genswarms.Observer.ScopeTest do
     assert state.feed_cursors == %{}
   end
 
+  # ── first-read drain (restart batch-boundary) ─────────────────────────────
+
+  test "first read drains the ring to head — an answered pair split across page boundaries never false-alerts" do
+    # Observer restart: the cursor reseeds 0 while the host ring holds an OLD
+    # answered pair. The server pages the replay; the open lands in page 1
+    # and its ok reply in page 2. A single-page first read would track the
+    # open on tick 1 and false-alert (> 15 min old) before tick 2 ever saw
+    # the reply — the drain unions the pages so the pair cancels first.
+    open = feed_event("request_open", "tg:7:0", @t0 - 30 * 60_000)
+    reply = feed_event("reply_sent", "tg:7:0", @t0 - 29 * 60_000, %{"ok" => true})
+
+    %{state: state, fake: fake} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, fn
+              0 -> {:ok, %{events: [open], seq: 1}}
+              1 -> {:ok, %{events: [reply], seq: 2}}
+              2 -> {:ok, %{events: [], seq: 2}}
+            end)
+        }
+      )
+
+    {reply_json, state} = decode_reply(tick(state))
+    assert reply_json["alerts"] == 0
+    assert state.feed_cursors == %{"wingston" => 2}
+
+    sinces = for %{kind: :events_feed, since: s} <- Client.Fake.calls(fake), do: s
+    assert sinces == [0, 1, 2]
+  end
+
+  test "a genuinely-unanswered old request still alerts through the drained union" do
+    # Draining must FEED the backlog to the detectors, not skip to head — an
+    # old open with no reply anywhere in the ring is a real alert.
+    open = feed_event("request_open", "tg:8:0", @t0 - 30 * 60_000)
+
+    %{state: state, outbox: outbox} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, fn
+              0 -> {:ok, %{events: [open], seq: 1}}
+              _ -> {:ok, %{events: [], seq: 1}}
+            end)
+        }
+      )
+
+    {reply_json, _state} = decode_reply(tick(state))
+    assert reply_json["alerts"] == 1
+    [delivery] = sent(outbox)
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "unanswered"
+  end
+
+  test "the first-read drain is bounded — a pathological always-growing feed cannot loop a tick forever" do
+    %{state: state, fake: fake} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, fn since ->
+              {:ok, %{events: [feed_event("chatter", "x", @t0)], seq: since + 1}}
+            end)
+        }
+      )
+
+    {reply_json, state} = decode_reply(tick(state))
+    assert reply_json["ok"] == true
+
+    feed_calls = for %{kind: :events_feed} <- Client.Fake.calls(fake), do: :call
+    assert length(feed_calls) == 10
+    assert state.feed_cursors == %{"wingston" => 10}
+  end
+
+  test "a mid-drain error discards the partial batch and leaves the cursor unset for a clean retry" do
+    # Feeding a partial drain to the detectors would recreate the exact
+    # batch-boundary false-alert the drain exists to prevent — on any
+    # mid-drain failure the whole read reports as an error and the cursor
+    # stays unset, so the next tick re-drains from 0 (nothing is lost: the
+    # cursor never advanced).
+    open = feed_event("request_open", "tg:7:0", @t0 - 30 * 60_000)
+    reply_ev = feed_event("reply_sent", "tg:7:0", @t0 - 29 * 60_000, %{"ok" => true})
+
+    %{state: state, fake: fake, clock: clock} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, fn
+              0 -> {:ok, %{events: [open], seq: 1}}
+              _ -> {:error, :boom}
+            end)
+        }
+      )
+
+    {reply_json, state} = decode_reply(tick(state))
+    assert reply_json["alerts"] == 0
+    assert state.feed_cursors == %{}
+
+    health = status_health(state)["wingston"]
+    assert health["fetch"]["last_error"] =~ "boom"
+
+    # feed recovers: the next tick re-drains from 0 and sees the whole pair
+    Client.Fake.put(
+      fake,
+      "wingston",
+      Map.put(healthy_fixture(), :events_feed, fn
+        0 -> {:ok, %{events: [open, reply_ev], seq: 2}}
+        _ -> {:ok, %{events: [], seq: 2}}
+      end)
+    )
+
+    advance(clock, 60_000)
+    {reply_json2, state} = decode_reply(tick(state))
+    assert reply_json2["alerts"] == 0
+    assert state.feed_cursors == %{"wingston" => 2}
+  end
+
+  test "a non-advancing nonempty page (echo/mid-drain feed restart) stops the drain without duplicating events" do
+    # A static page that keeps answering the same events with the same seq
+    # must not be appended twice into the union.
+    open = feed_event("request_open", "tg:9:0", @t0 - 20 * 60_000)
+
+    %{state: state, outbox: outbox} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, {:ok, %{events: [open], seq: 1}})
+        }
+      )
+
+    {reply_json, state} = decode_reply(tick(state))
+    assert reply_json["alerts"] == 1
+    assert state.feed_cursors == %{"wingston" => 1}
+    assert length(sent(outbox)) == 1
+  end
+
   test "feed :unavailable keeps the fetch stage healthy (a host without an EventsSource is not an error)" do
     # healthy_fixture/0 has no :events_feed — the Fake answers :unavailable,
     # exactly like a dashboard whose host never wired an EventsSource.
