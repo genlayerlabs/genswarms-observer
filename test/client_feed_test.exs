@@ -48,6 +48,19 @@ defmodule Genswarms.Observer.ClientFeedTest do
     end
   end
 
+  describe "Http.feed_url/3" do
+    test "carries the cursor AND an explicit limit=500 — never rides the server default" do
+      # plug.ex:123 parses "limit" with a default of 500 and notes "the host
+      # impl may clamp limit tighter" (micromarkets caps at 1_000). 500 is
+      # explicit page-size pinning, not a behavior change: it equals the
+      # route's own default and sits under every known host clamp, and
+      # Scope's 10-page first-read drain × 500 covers both known rings
+      # (wingston 4_096, micromarkets 5_000).
+      assert Client.Http.feed_url("http://dash.example:4994", "wingston", 7) ==
+               "http://dash.example:4994/api/swarms/wingston/events/feed?since=7&limit=500"
+    end
+  end
+
   describe "Fake.get_events_feed/5" do
     test "answers the configured fixture and records the since cursor" do
       {:ok, fake} =
