@@ -667,6 +667,32 @@ defmodule Genswarms.Observer.DetectorsUxTest do
                  %{ctx | state: state}
                )
     end
+
+    @tag regression: "F9"
+    test "old bare-ms persisted state + seq-carrying replay of the same event does not double-count" do
+      ts = 1_751_734_800.0
+      ms = round(ts * 1000)
+
+      # Old-format persisted state (pre-upgrade): bare ms integers.
+      old_state = %{fail_ts: %{}, reply_failed_ts: [ms]}
+
+      # Restart replay: the SAME failure re-delivered, now with its seq.
+      events = [%{"kind" => "reply_failed", "seq" => 10, "ts" => ts}]
+
+      ctx = %{
+        swarm: "wingston",
+        thresholds: %{"delivery_failure.count" => 2, "delivery_failure.window_s" => 600},
+        state: old_state,
+        now_ms: ms + 2_000
+      }
+
+      # threshold 2: a double-count would fire a spurious burst here.
+      assert {[], state} =
+               Genswarms.Observer.Detectors.DeliveryFailureBurst.detect(%{feed: {:ok, events}}, ctx)
+
+      assert length(state.reply_failed_ts) == 1
+      assert [{{:seq, 10}, ^ms}] = state.reply_failed_ts
+    end
   end
 
   # ── TopicsStale ──────────────────────────────────────────────────────────────

@@ -145,8 +145,23 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
 
   defp append_dedup(nil, entry), do: [entry]
 
-  defp append_dedup(list, {key, _ms} = entry) do
-    if List.keymember?(list, key, 0), do: list, else: [entry | list]
+  defp append_dedup(list, {key, ms} = entry) do
+    cond do
+      List.keymember?(list, key, 0) ->
+        list
+
+      # Restart-over-old-store safety: a legacy migrated entry ({:ts, ms})
+      # and a seq-keyed replay of the SAME event carry the same ms —
+      # supersede the legacy entry instead of double-counting. Ambiguity is
+      # resolved conservatively (a distinct new same-ms event would also
+      # supersede): exactly the old exact-ts semantics until legacy entries
+      # age out of the window.
+      match?({:seq, _}, key) and List.keymember?(list, {:ts, ms}, 0) ->
+        List.keyreplace(list, {:ts, ms}, 0, entry)
+
+      true ->
+        [entry | list]
+    end
   end
 
   defp prune(state, now_ms, window_ms) do
