@@ -9,11 +9,21 @@ defmodule Genswarms.Observer.Objects.Scope do
   - Tokens enter as env-var NAMES (`token_env`, x-secret contract §14.2.1)
     and are resolved at fetch time — never stored in config, state dumps are
     still safe because the resolved value never leaves the fetch closure.
-  - Detection runs through `DetectorRunner`, over `state.detectors`
-    (`Genswarms.Observer.Detectors` plus, from O5, any registered custom
-    detectors) — pure, deterministic, no LLM. Each detector's state is
-    isolated per `{swarm, module}` — a crash or malformed return in one
-    detector never corrupts another's state or stops the tick.
+  - Detection runs through `DetectorRunner`, over the built-ins
+    (`state.detectors`) plus, per swarm, any scoped `custom_detectors` —
+    pure, deterministic, no LLM. Each detector's state is isolated per
+    `{swarm, module}` — a crash or malformed return in one detector never
+    corrupts another's state or stops the tick.
+  - `custom_detectors` (config key, boot-time only, NEVER x-mutable) is the
+    operator's explicit allowlist for third-party detector code sharing this
+    trust boundary — vendored via `gsp` and digest-pinned by the notary.
+    Resolution here is fail-CLOSED: an unresolvable module or one missing
+    `detect/2` raises at `init/1` (a boot error), it is never skipped —
+    a typo silently dropping a detector is worse than a crash. Boot also
+    collects `default_thresholds/0` from every detector module (built-ins
+    and customs) and raises on a threshold KEY COLLISION across modules
+    (two modules declaring the same key); an undeclared-but-referenced
+    threshold key can't be known statically and is NOT checked here.
   - Dedupe + cooldown per alert `key` (default `{swarm, type}`, wingston
     roster pattern) lives here: a persisting condition alerts once per
     cooldown window, not once per tick. A per-swarm-per-tick alert budget
@@ -49,11 +59,21 @@ defmodule Genswarms.Observer.Objects.Scope do
   @alert_budget_per_swarm 6
   @period_re ~r/^\d{4}-\d{2}-\d{2}$/
 
+  @builtin_detectors [
+    Detectors,
+    Genswarms.Observer.Detectors.Unanswered,
+    Genswarms.Observer.Detectors.DeliveryFailureBurst,
+    Genswarms.Observer.Detectors.TopicsStale
+  ]
+
   # ── init ──────────────────────────────────────────────────────────────────
 
   def init(config) do
     swarm_name = cfg(config, :swarm_name, "observer")
     now_fn = cfg(config, :now_fn, fn -> System.system_time(:millisecond) end)
+
+    custom_detectors = resolve_custom_detectors!(cfg(config, :custom_detectors, []))
+    check_threshold_collisions!(@builtin_detectors ++ Enum.map(custom_detectors, & &1.module))
 
     state = %{
       swarm_name: swarm_name,
@@ -76,14 +96,14 @@ defmodule Genswarms.Observer.Objects.Scope do
           cfg(config, :store_mod, Genswarms.Observer.Store.InMemory),
           Genswarms.Observer.Store.InMemory
         ),
-      # Built-ins today; custom detector registration (per-swarm scoped,
-      # boot-time only, never x-mutable) lands in O5. NOT read from config.
-      detectors: [
-        Detectors,
-        Genswarms.Observer.Detectors.Unanswered,
-        Genswarms.Observer.Detectors.DeliveryFailureBurst,
-        Genswarms.Observer.Detectors.TopicsStale
-      ],
+      detectors: @builtin_detectors,
+      # O5: config key `custom_detectors`, resolved fail-closed above.
+      # Each entry `%{module: mod, swarms: nil | [name, ...]}` — `nil`/`[]`
+      # means global (runs for every observed swarm); otherwise scoped to
+      # exactly those swarm names. Boot-time only, never read again after
+      # init, NEVER x-mutable (loading third-party code is the operator's
+      # explicit allowlist, not a hot-tunable).
+      custom_detectors: custom_detectors,
       # Nested per swarm, then per detector module: `det[swarm][module]`.
       # Isolates one detector's state from another's under DetectorRunner.
       det: %{},
@@ -337,7 +357,7 @@ defmodule Genswarms.Observer.Objects.Scope do
         swarm_det_states = Map.get(st.det, swarm, %{})
 
         {alerts, swarm_det_states, _health} =
-          DetectorRunner.run(st.detectors, data, swarm, st.thresholds, swarm_det_states, now)
+          DetectorRunner.run(detectors_for(st, swarm), data, swarm, st.thresholds, swarm_det_states, now)
 
         st = %{st | det: Map.put(st.det, swarm, swarm_det_states)}
 
@@ -725,5 +745,145 @@ defmodule Genswarms.Observer.Objects.Scope do
     String.to_existing_atom("Elixir." <> String.trim_leading(name, "Elixir."))
   rescue
     ArgumentError -> default
+  end
+
+  # ── custom detectors (O5) ────────────────────────────────────────────────
+  #
+  # `custom_detectors` config: a list of entries, each either a bare module
+  # (atom from an Elixir swarm def, or "Elixir.Some.Module" string — global,
+  # runs for every swarm) or `%{module: mod_ref, swarms: [name, ...]}`
+  # (scoped to those swarm names; `swarms: nil` or `[]` is also global).
+  # Resolution is fail-CLOSED: unlike `module_ref/2` (used for `client`/
+  # `store_mod`, which fall back to a safe default), an unresolvable module
+  # or one missing `detect/2` RAISES here — this key is the operator's
+  # explicit allowlist for third-party code sharing the observer's trust
+  # boundary, so a typo silently dropping a detector is worse than a boot
+  # crash that names the offending module.
+
+  defp detectors_for(state, swarm) do
+    customs =
+      state.custom_detectors
+      |> Enum.filter(&custom_detector_scoped?(&1, swarm))
+      |> Enum.map(& &1.module)
+
+    state.detectors ++ customs
+  end
+
+  defp custom_detector_scoped?(%{swarms: nil}, _swarm), do: true
+  defp custom_detector_scoped?(%{swarms: []}, _swarm), do: true
+  defp custom_detector_scoped?(%{swarms: swarms}, swarm), do: swarm in swarms
+
+  defp resolve_custom_detectors!(entries) when is_list(entries) do
+    Enum.map(entries, &resolve_custom_detector!/1)
+  end
+
+  defp resolve_custom_detectors!(other) do
+    raise ArgumentError,
+          "custom_detectors: expected a list, got #{inspect(other)}"
+  end
+
+  defp resolve_custom_detector!(entry) when is_map(entry) do
+    mod_ref = entry_get(entry, :module)
+    swarms = entry_get(entry, :swarms)
+    %{module: resolve_detector_module!(mod_ref), swarms: normalize_custom_swarms!(swarms)}
+  end
+
+  defp resolve_custom_detector!(mod_ref) when is_binary(mod_ref) or is_atom(mod_ref) do
+    %{module: resolve_detector_module!(mod_ref), swarms: nil}
+  end
+
+  defp resolve_custom_detector!(other) do
+    raise ArgumentError,
+          "custom_detectors: invalid entry #{inspect(other)} — expected a module " <>
+            "(atom or \"Elixir.Some.Module\" string) or %{module: ref, swarms: [...]}"
+  end
+
+  defp normalize_custom_swarms!(nil), do: nil
+  defp normalize_custom_swarms!([]), do: nil
+
+  defp normalize_custom_swarms!(list) when is_list(list) do
+    Enum.map(list, &to_string/1)
+  end
+
+  defp normalize_custom_swarms!(other) do
+    raise ArgumentError,
+          "custom_detectors: swarms must be a list of swarm names, got #{inspect(other)}"
+  end
+
+  defp resolve_detector_module!(nil) do
+    raise ArgumentError, "custom_detectors: entry is missing its required :module key"
+  end
+
+  defp resolve_detector_module!(mod) when is_atom(mod) do
+    ensure_detector_module!(mod, inspect(mod))
+  end
+
+  defp resolve_detector_module!(name) when is_binary(name) do
+    mod =
+      try do
+        String.to_existing_atom("Elixir." <> String.trim_leading(name, "Elixir."))
+      rescue
+        ArgumentError ->
+          raise ArgumentError,
+                "custom_detectors: module #{inspect(name)} could not be resolved (not " <>
+                  "loaded/known) — check the module name, and that the package providing it " <>
+                  "is vendored (fail-closed: this key is an explicit allowlist, so a typo must " <>
+                  "not silently drop a detector)"
+      end
+
+    ensure_detector_module!(mod, inspect(name))
+  end
+
+  defp resolve_detector_module!(other) do
+    raise ArgumentError,
+          "custom_detectors: module must be a string or atom, got #{inspect(other)}"
+  end
+
+  defp ensure_detector_module!(mod, label) do
+    Code.ensure_loaded(mod)
+
+    unless function_exported?(mod, :detect, 2) do
+      raise ArgumentError,
+            "custom_detectors: module #{label} (#{inspect(mod)}) does not export detect/2 — " <>
+              "not a valid Genswarms.Observer.Detector"
+    end
+
+    mod
+  end
+
+  # Boot-time-only slice of threshold validation: two detector modules
+  # (built-in or custom) declaring the SAME `default_thresholds/0` key is
+  # unambiguously a config bug (whichever module's default wins is
+  # accidental), so it raises here. Cannot check the complementary case —
+  # a threshold key referenced by a detector but declared by none — that
+  # would require executing every detector, which init/1 does not do.
+  defp check_threshold_collisions!(modules) do
+    key_owners =
+      modules
+      |> Enum.uniq()
+      |> Enum.reduce(%{}, fn mod, acc ->
+        Code.ensure_loaded(mod)
+
+        if function_exported?(mod, :default_thresholds, 0) do
+          mod.default_thresholds()
+          |> Map.keys()
+          |> Enum.reduce(acc, fn key, acc -> Map.update(acc, key, [mod], &[mod | &1]) end)
+        else
+          acc
+        end
+      end)
+
+    collisions = for {key, mods} <- key_owners, length(mods) > 1, into: %{}, do: {key, mods}
+
+    if map_size(collisions) > 0 do
+      details =
+        collisions
+        |> Enum.map_join("; ", fn {key, mods} ->
+          "#{inspect(key)} declared by #{Enum.map_join(mods, ", ", &inspect/1)}"
+        end)
+
+      raise ArgumentError,
+            "observer boot: default_thresholds/0 key collision across detector modules: #{details}"
+    end
   end
 end

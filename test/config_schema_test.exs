@@ -5,7 +5,8 @@ defmodule Genswarms.Observer.ConfigSchemaTest do
   # the schema<->init conformance below catches drift in either direction
   @init_keys ~w(swarm_name name registry thresholds cooldown_minutes
                 alert_conversation_id tick_sources read_sources sender
-                escalate_to client client_opts now_fn deliver_fn)
+                escalate_to client client_opts now_fn deliver_fn
+                custom_detectors)
 
   defp schema do
     Path.join(__DIR__, "../swarm-object.json")
@@ -56,6 +57,27 @@ defmodule Genswarms.Observer.ConfigSchemaTest do
     refute "read_sources" in mutable
     refute "sender" in mutable
     refute "escalate_to" in mutable
+
+    # custom_detectors loads third-party code — boot-only allowlist, same
+    # class as tick_sources/read_sources, never a hot-patchable surface.
+    refute "custom_detectors" in mutable
+  end
+
+  test "custom_detectors is declared boot-only (no x-mutable) — a config patch touching it is rejected" do
+    props = schema()["properties"]
+    custom_detectors = props["custom_detectors"]
+
+    assert custom_detectors, "custom_detectors must be declared in the config schema"
+    refute custom_detectors["x-mutable"] == true
+
+    # The engine's update_config op only patches keys the schema marks
+    # x-mutable: true (upstream gate, not exercised by this package's
+    # tests). Asserting the schema's own declaration is the conformance
+    # check available here — mirrors how tick_sources/read_sources/sender/
+    # escalate_to are verified non-mutable above, without inventing an
+    # engine simulation this repo doesn't otherwise have.
+    mutable = for {k, v} <- props, v["x-mutable"] == true, do: k
+    refute "custom_detectors" in mutable
   end
 
   test "a config drawn from the schema boots the handler" do

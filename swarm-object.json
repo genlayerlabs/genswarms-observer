@@ -51,6 +51,21 @@
         "items": { "type": "string" },
         "description": "Nodes allowed to call status/get_dashboard/get_events (fail-closed allowlist; the diagnosis agent)."
       },
+      "custom_detectors": {
+        "type": "array",
+        "description": "Third-party detector modules to run alongside the built-ins. Boot-time only — read once at init/1, never re-read, NEVER hot-mutable: loading in-process code is the operator's explicit allowlist, not a tuning knob. Each entry is either a bare module (a fully-qualified module string/atom, applied to every observed swarm) or {module, swarms: [name, ...]} to scope it to specific swarms (swarms omitted/empty = global). Modules are vendored via gsp (swarmidx:<scope>/<pkg>@<ver>) and digest-pinned by the notary; an unresolvable module or one missing detect/2 raises at boot (fail-closed) rather than being silently skipped.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "module": { "type": "string", "description": "Fully-qualified detector module implementing Genswarms.Observer.Detector." },
+            "swarms": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Swarm names this detector runs against; omit or empty for all observed swarms."
+            }
+          }
+        }
+      },
       "sender": {
         "type": "string",
         "description": "Topology object that receives alert cards (default: sender)."

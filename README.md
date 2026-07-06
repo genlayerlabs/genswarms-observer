@@ -24,6 +24,25 @@ as diagnosis tasks to an isolated agent.
 
 Dedupe + cooldown per `(swarm, type)` in `:scope` (`cooldown_minutes`, 30).
 
+## Custom detectors (boot-only)
+
+`custom_detectors` registers third-party `Genswarms.Observer.Detector`
+modules alongside the built-ins — a bare module (global, runs for every
+observed swarm) or `%{module: mod, swarms: ["mm"]}` to scope it to specific
+swarms. Package detectors are vendored via
+`gsp vendor swarmidx:<scope>/<pkg-detector>@<ver>` — digest-pinned by the
+notary; referencing a module here is the explicit allowlist. In-process
+code shares the observer's trust boundary (spec §5.2) — it runs with the
+same privileges as the built-in detectors, so only vendor modules you trust
+as much as this codebase itself.
+
+Resolved once at `init/1` and never again: this key is **not** `x-mutable`
+(see `swarm-object.json`), and an unresolvable module or one missing
+`detect/2` raises at boot rather than being silently skipped — loading
+third-party code is a deliberate operator decision, and a typo here should
+fail loudly, not quietly drop a detector. Boot also raises if two detector
+modules (built-in or custom) declare the same `default_thresholds/0` key.
+
 ## Principles
 
 - Detectors are pure functions; the LLM only diagnoses (fase 3).
