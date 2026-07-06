@@ -19,6 +19,18 @@ defmodule Genswarms.Observer.Objects.Scope do
     cooldown window, not once per tick. A per-swarm-per-tick alert budget
     (default 6) caps how many cards one tick can emit for one swarm;
     overflow collapses into a single `:alerts_coalesced` summary alert.
+  - Durability is injectable (`Genswarms.Observer.Store`, config key
+    `store_mod`, default `Store.InMemory`): `init/1` loads `det`,
+    `last_alert` and `seen_periods` back and VALIDATES them here (the store
+    itself is a dumb bag of terms) — future period ids and future cooldown
+    timestamps are dropped, and a loaded `save_seq` behind this session's
+    own watermark (config key `save_seq`, default 0 — meaningful only to a
+    caller/host that kept one across a restart) synthesizes a
+    `:store_rollback` alert, queued in `pending_alerts` and drained through
+    the normal cooldown gate on the next tick. `save/1` runs at the end of
+    any tick that mutated `det` or `last_alert`. A raising/crashing store
+    must never take :scope down — load/save are fail-open (log, keep
+    going); the VALIDATION itself is fail-closed (reject, don't trust).
 
   Actions (all allowlisted, fail-closed — empty list means nobody):
   - `tick` (tick_sources, normally just cron): fetch + detect + alert.
@@ -34,11 +46,13 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   @alerts_kept 50
   @alert_budget_per_swarm 6
+  @period_re ~r/^\d{4}-\d{2}-\d{2}$/
 
   # ── init ──────────────────────────────────────────────────────────────────
 
   def init(config) do
     swarm_name = cfg(config, :swarm_name, "observer")
+    now_fn = cfg(config, :now_fn, fn -> System.system_time(:millisecond) end)
 
     state = %{
       swarm_name: swarm_name,
@@ -51,10 +65,16 @@ defmodule Genswarms.Observer.Objects.Scope do
       sender: node_ref(cfg(config, :sender, :sender)),
       escalate_to: escalate_ref(cfg(config, :escalate_to, nil)),
       alert_conversation_id: cfg(config, :alert_conversation_id, nil),
-      client: module_ref(cfg(config, :client, Genswarms.Observer.Client.Http)),
+      client:
+        module_ref(cfg(config, :client, Genswarms.Observer.Client.Http), Genswarms.Observer.Client.Http),
       client_opts: cfg(config, :client_opts, []),
-      now_fn: cfg(config, :now_fn, fn -> System.system_time(:millisecond) end),
+      now_fn: now_fn,
       deliver_fn: cfg(config, :deliver_fn, default_deliver_fn(swarm_name)),
+      store_mod:
+        module_ref(
+          cfg(config, :store_mod, Genswarms.Observer.Store.InMemory),
+          Genswarms.Observer.Store.InMemory
+        ),
       # Built-ins today; custom detector registration (per-swarm scoped,
       # boot-time only, never x-mutable) lands in O5. NOT read from config.
       detectors: [
@@ -67,11 +87,170 @@ defmodule Genswarms.Observer.Objects.Scope do
       # Isolates one detector's state from another's under DetectorRunner.
       det: %{},
       last_alert: %{},
+      # O4: unseen digest period ids per swarm. Persisted, validated on load.
+      seen_periods: %{},
+      # This session's own durability watermark. A caller/host that kept
+      # one across a restart passes it in; a genuinely first-ever boot has
+      # nothing to compare against, so 0 never false-positives a rollback.
+      save_seq: cfg(config, :save_seq, 0),
+      # Rollback alert (if any) queued here at boot, drained through the
+      # normal cooldown gate on the first tick.
+      pending_alerts: [],
       last_tick_ms: nil,
       alerts: []
     }
 
-    {:ok, state}
+    {:ok, load_store(state, now_fn.())}
+  end
+
+  # ── store: load + validate ───────────────────────────────────────────────
+
+  defp load_store(state, now) do
+    case safe_store_load(state.store_mod) do
+      :empty ->
+        state
+
+      {:ok, saved} when is_map(saved) ->
+        merge_loaded(state, saved, now)
+
+      {:error, reason} ->
+        Logger.warning("[observer] store.load/0 returned error #{inspect(reason)} — booting empty")
+        state
+
+      other ->
+        Logger.warning("[observer] store.load/0 returned malformed #{inspect(other)} — booting empty")
+        state
+    end
+  end
+
+  # A raising/exiting store must never block boot — durability is fail-open.
+  defp safe_store_load(store_mod) do
+    store_mod.load()
+  rescue
+    e ->
+      Logger.warning("[observer] store.load/0 raised #{Exception.message(e)} — booting empty")
+      :empty
+  catch
+    kind, reason ->
+      Logger.warning("[observer] store.load/0 #{kind} #{inspect(reason)} — booting empty")
+      :empty
+  end
+
+  defp merge_loaded(state, saved, now) do
+    loaded_seq = Map.get(saved, :save_seq, 0)
+    det = saved |> Map.get(:det, %{}) |> validate_det()
+    last_alert = saved |> Map.get(:last_alert, %{}) |> validate_last_alert(now)
+    seen_periods = saved |> Map.get(:seen_periods, %{}) |> validate_seen_periods(now)
+
+    if loaded_seq < state.save_seq do
+      Logger.warning(
+        "[observer] store rollback: loaded save_seq=#{loaded_seq} < session save_seq=#{state.save_seq}"
+      )
+
+      %{
+        state
+        | det: det,
+          last_alert: last_alert,
+          seen_periods: seen_periods,
+          pending_alerts: [rollback_alert(state, loaded_seq, now)]
+      }
+    else
+      %{state | det: det, last_alert: last_alert, seen_periods: seen_periods, save_seq: loaded_seq}
+    end
+  end
+
+  defp rollback_alert(state, loaded_seq, now) do
+    %{
+      key: {:store, :rollback},
+      type: :store_rollback,
+      swarm: state.swarm_name,
+      at_ms: now,
+      summary:
+        "observer store loaded save_seq=#{loaded_seq}, older than this session's known " <>
+          "#{state.save_seq} — possible stale restore",
+      evidence: %{"loaded_seq" => loaded_seq, "session_seq" => state.save_seq},
+      cids: []
+    }
+  end
+
+  # det is opaque to Scope — kept as-is, only type-checked so a poisoned
+  # value can't crash DetectorRunner downstream.
+  defp validate_det(det) when is_map(det), do: det
+  defp validate_det(_), do: %{}
+
+  defp validate_last_alert(map, now) when is_map(map) do
+    Map.filter(map, fn {_key, at_ms} -> is_integer(at_ms) and at_ms <= now end)
+  end
+
+  defp validate_last_alert(_, _now), do: %{}
+
+  defp validate_seen_periods(map, now) when is_map(map) do
+    tomorrow = now |> DateTime.from_unix!(:millisecond) |> DateTime.to_date() |> Date.add(1)
+
+    Map.new(map, fn {swarm, periods} ->
+      valid =
+        periods
+        |> periods_to_list()
+        |> Enum.filter(&valid_period?(&1, tomorrow))
+        |> MapSet.new()
+
+      {swarm, valid}
+    end)
+  end
+
+  defp validate_seen_periods(_, _now), do: %{}
+
+  defp periods_to_list(%MapSet{} = set), do: MapSet.to_list(set)
+  defp periods_to_list(list) when is_list(list), do: list
+  defp periods_to_list(_), do: []
+
+  defp valid_period?(id, tomorrow) when is_binary(id) do
+    Regex.match?(@period_re, id) and
+      case Date.from_iso8601(id) do
+        {:ok, date} -> Date.compare(date, tomorrow) != :gt
+        _ -> false
+      end
+  end
+
+  defp valid_period?(_, _tomorrow), do: false
+
+  # ── store: save ───────────────────────────────────────────────────────────
+
+  defp persist(state) do
+    next_seq = state.save_seq + 1
+
+    payload = %{
+      det: state.det,
+      last_alert: state.last_alert,
+      seen_periods: state.seen_periods,
+      save_seq: next_seq
+    }
+
+    case safe_store_save(state.store_mod, payload) do
+      :ok -> %{state | save_seq: next_seq}
+      _other -> state
+    end
+  end
+
+  # A raising/exiting store must never take :scope down — durability is
+  # fail-open: log and keep going with in-memory state for this tick.
+  defp safe_store_save(store_mod, payload) do
+    case store_mod.save(payload) do
+      :ok ->
+        :ok
+
+      other ->
+        Logger.warning("[observer] store.save/1 returned #{inspect(other)} — durability skipped this tick")
+        other
+    end
+  rescue
+    e ->
+      Logger.warning("[observer] store.save/1 raised #{Exception.message(e)} — durability skipped this tick")
+      {:error, {:raised, e}}
+  catch
+    kind, reason ->
+      Logger.warning("[observer] store.save/1 #{kind} #{inspect(reason)} — durability skipped this tick")
+      {:error, {kind, reason}}
   end
 
   def interface do
@@ -144,9 +323,14 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   defp tick(state) do
     now = state.now_fn.()
+    orig_det = state.det
+    orig_last_alert = state.last_alert
+
+    {state, pending_fired, pending_suppressed} = drain_pending_alerts(state, now)
 
     {state, fired, suppressed} =
-      Enum.reduce(state.registry, {state, 0, 0}, fn {swarm, entry}, {st, fired, supp} ->
+      Enum.reduce(state.registry, {state, pending_fired, pending_suppressed}, fn {swarm, entry},
+                                                                                  {st, fired, supp} ->
         data = fetch(swarm, entry, st)
         swarm_det_states = Map.get(st.det, swarm, %{})
 
@@ -173,6 +357,13 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     state = %{state | last_tick_ms: now}
 
+    state =
+      if state.det != orig_det or state.last_alert != orig_last_alert do
+        persist(state)
+      else
+        state
+      end
+
     {:reply,
      Jason.encode!(%{
        ok: true,
@@ -180,6 +371,22 @@ defmodule Genswarms.Observer.Objects.Scope do
        alerts: fired,
        suppressed: suppressed
      }), state}
+  end
+
+  # Rollback (and, later, any other system-level) alerts detected outside a
+  # per-swarm context are stashed at boot and drained through the SAME
+  # cooldown gate as detector alerts on the first tick — no bespoke alerting
+  # path for a case that's rare by construction.
+  defp drain_pending_alerts(%{pending_alerts: []} = state, _now), do: {state, 0, 0}
+
+  defp drain_pending_alerts(state, now) do
+    Enum.reduce(state.pending_alerts, {%{state | pending_alerts: []}, 0, 0}, fn alert, {st, fired, supp} ->
+      if cooled_down?(st, alert, now) do
+        {emit_alert(st, alert, %{}), fired + 1, supp}
+      else
+        {st, fired, supp + 1}
+      end
+    end)
   end
 
   defp fetch(swarm, entry, state) do
@@ -451,11 +658,11 @@ defmodule Genswarms.Observer.Objects.Scope do
     ArgumentError -> name
   end
 
-  defp module_ref(mod) when is_atom(mod), do: mod
+  defp module_ref(mod, _default) when is_atom(mod), do: mod
 
-  defp module_ref(name) when is_binary(name) do
+  defp module_ref(name, default) when is_binary(name) do
     String.to_existing_atom("Elixir." <> String.trim_leading(name, "Elixir."))
   rescue
-    ArgumentError -> Genswarms.Observer.Client.Http
+    ArgumentError -> default
   end
 end

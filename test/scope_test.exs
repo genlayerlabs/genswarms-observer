@@ -6,6 +6,15 @@ defmodule Genswarms.Observer.ScopeTest do
 
   @t0 1_751_734_800_000
 
+  # These tests exercise alerting/detector behavior, not durability — the
+  # real `Store.InMemory` default is a process-wide singleton (by design,
+  # see store.ex) and would leak `last_alert`/`det` across async tests.
+  defmodule NullStore do
+    @behaviour Genswarms.Observer.Store
+    def load, do: :empty
+    def save(_saved), do: :ok
+  end
+
   defp iso(ms) when is_integer(ms),
     do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601()
 
@@ -48,6 +57,7 @@ defmodule Genswarms.Observer.ScopeTest do
           alert_conversation_id: "tg:42:0",
           client: Client.Fake,
           client_opts: [fake: fake],
+          store_mod: NullStore,
           now_fn: fn -> Agent.get(clock, & &1) end,
           deliver_fn: fn target, from, content ->
             Agent.update(outbox, &[%{target: target, from: from, content: content} | &1])
