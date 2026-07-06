@@ -149,6 +149,82 @@ defmodule Genswarms.Observer.DetectorsUxTest do
     test "default_thresholds exposes only its namespaced key" do
       assert Unanswered.default_thresholds() == %{"unanswered.minutes" => 15}
     end
+
+    test "pruning evicts an alerted cid whose opened_ms is more than 24h stale" do
+      now_ms = 100_000_000
+      opened_ms = now_ms - 25 * 60 * 60 * 1000
+      state = %{"tg:1:0" => %{opened_ms: opened_ms, alerted: true}}
+
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: state,
+        now_ms: now_ms
+      }
+
+      {alerts, new_state} = Unanswered.detect(fetched([]), ctx)
+
+      assert alerts == []
+      assert new_state == %{}
+    end
+
+    test "an alerted cid only 1h stale is kept" do
+      now_ms = 100_000_000
+      opened_ms = now_ms - 60 * 60 * 1000
+      state = %{"tg:1:0" => %{opened_ms: opened_ms, alerted: true}}
+
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: state,
+        now_ms: now_ms
+      }
+
+      {alerts, new_state} = Unanswered.detect(fetched([]), ctx)
+
+      assert alerts == []
+      assert new_state == state
+    end
+
+    test "an unalerted old cid is NOT evicted (it may still legitimately alert)" do
+      now_ms = 100_000_000
+      opened_ms = now_ms - 25 * 60 * 60 * 1000
+      state = %{"tg:1:0" => %{opened_ms: opened_ms, alerted: false}}
+
+      # Large threshold so this tick doesn't itself fire an alert — isolating
+      # the prune behavior from the alert-firing behavior.
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 100_000},
+        state: state,
+        now_ms: now_ms
+      }
+
+      {alerts, new_state} = Unanswered.detect(fetched([]), ctx)
+
+      assert alerts == []
+      assert new_state == state
+    end
+
+    test "malformed timestamp on request_open is skipped; a later valid open for the same cid tracks normally" do
+      f =
+        fetched([
+          %{"kind" => "request_open", "cid" => "tg:1:0", "timestamp" => "not-a-timestamp"},
+          ev("request_open", "tg:1:0", 0)
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      {alerts, state} = Unanswered.detect(f, ctx0)
+
+      assert [%{type: :unanswered, cids: ["tg:1:0"]}] = alerts
+      assert state["tg:1:0"].opened_ms == 0
+    end
   end
 
   # ── DeliveryFailureBurst ─────────────────────────────────────────────────────

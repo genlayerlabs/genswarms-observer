@@ -18,6 +18,11 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
 
   @behaviour Genswarms.Observer.Detector
 
+  # Once alerted, a cid that's never replied to stays in state forever
+  # (the "reply clears it" path never fires) — evict it after this long so
+  # state doesn't grow unbounded.
+  @alerted_ttl_ms 24 * 60 * 60 * 1000
+
   @impl true
   def default_thresholds, do: %{"unanswered.minutes" => 15}
 
@@ -29,7 +34,17 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     minutes = ctx.thresholds["unanswered.minutes"]
     tracked = apply_events(events(fetched), ctx.state || %{})
 
-    scan(tracked, ctx.swarm, minutes, ctx.now_ms)
+    {alerts, new_state} = scan(tracked, ctx.swarm, minutes, ctx.now_ms)
+
+    {alerts, prune_stale_alerted(new_state, ctx.now_ms)}
+  end
+
+  defp prune_stale_alerted(tracked, now_ms) do
+    tracked
+    |> Enum.reject(fn {_cid, info} ->
+      info.alerted and now_ms - info.opened_ms > @alerted_ttl_ms
+    end)
+    |> Map.new()
   end
 
   defp events(%{events: {:ok, events}}) when is_list(events), do: events
@@ -39,7 +54,10 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     Enum.reduce(events, tracked, fn ev, acc ->
       case {kind(ev), ev["cid"]} do
         {"request_open", cid} when is_binary(cid) ->
-          Map.put_new(acc, cid, %{opened_ms: event_ms(ev), alerted: false})
+          case event_ms(ev) do
+            nil -> acc
+            ms -> Map.put_new(acc, cid, %{opened_ms: ms, alerted: false})
+          end
 
         {"reply_sent", cid} when is_binary(cid) ->
           if Map.get(ev, "ok", true), do: Map.delete(acc, cid), else: acc
