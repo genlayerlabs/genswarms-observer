@@ -571,9 +571,12 @@ defmodule Genswarms.Observer.ScopeTest do
     advance(clock, 60_000)
     {reply2, _state} = decode_reply(tick(state))
     # 6 fresh kept alerts, but the summary is inside its cooldown window:
-    # suppressed like any other same-key alert, not re-emitted every tick
+    # suppressed like any other same-key alert, not re-emitted every tick.
+    # Lifecycle: suppressed now counts every dropped alert — the 2 alerts
+    # dropped by the budget PLUS the coalesced summary itself (3), not the
+    # old 0/1-for-the-whole-overflow count.
     assert reply2["alerts"] == 6
-    assert reply2["suppressed"] == 1
+    assert reply2["suppressed"] == 3
 
     cards = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
     assert Enum.count(cards, &(&1["card"]["title"] =~ "alerts_coalesced")) == 1

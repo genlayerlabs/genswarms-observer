@@ -64,6 +64,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   alias Genswarms.Observer.DetectorRunner
   alias Genswarms.Observer.Digest
   alias Genswarms.Observer.Ingest
+  alias Genswarms.Observer.Lifecycle
 
   require Logger
 
@@ -514,27 +515,22 @@ defmodule Genswarms.Observer.Objects.Scope do
             st
           end
 
-        {passed, supp} =
-          Enum.reduce(quarantine_alerts ++ alerts, {[], supp}, fn alert, {passed, supp} ->
-            if cooled_down?(st, alert, now) do
-              {[alert | passed], supp}
-            else
-              {passed, supp + 1}
-            end
-          end)
+        %{emit: budgeted, suppressed: tick_suppressed, last_alert: new_last_alert} =
+          Lifecycle.process(
+            quarantine_alerts ++ alerts,
+            st.last_alert,
+            st.cooldown_minutes * 60_000,
+            @alert_budget_per_swarm,
+            swarm,
+            now
+          )
 
-        # Same-key dedupe WITHIN the tick: cooldown above compares against
-        # pre-emit last_alert for the whole batch, so two same-key alerts
-        # from one detect/2 would both pass it and both deliver.
-        deduped = passed |> Enum.reverse() |> Enum.uniq_by(&alert_key/1)
-
-        {budgeted, coalesced_suppressed} = apply_alert_budget(st, deduped, swarm, now)
-
+        st = %{st | last_alert: new_last_alert}
         st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry, now) end)
 
         st = deliver_digest(st, swarm, data, now)
 
-        {st, fired + length(budgeted), supp + coalesced_suppressed}
+        {st, fired + length(budgeted), supp + tick_suppressed}
       end)
 
     state = %{state | last_tick_ms: now}
@@ -563,13 +559,20 @@ defmodule Genswarms.Observer.Objects.Scope do
   defp drain_pending_alerts(%{pending_alerts: []} = state, _now), do: {state, 0, 0}
 
   defp drain_pending_alerts(state, now) do
-    Enum.reduce(state.pending_alerts, {%{state | pending_alerts: []}, 0, 0}, fn alert, {st, fired, supp} ->
-      if cooled_down?(st, alert, now) do
-        {emit_alert(st, alert, %{}, now), fired + 1, supp}
-      else
-        {st, fired, supp + 1}
-      end
-    end)
+    %{emit: emit, suppressed: suppressed, last_alert: new_last_alert} =
+      Lifecycle.process(
+        state.pending_alerts,
+        state.last_alert,
+        state.cooldown_minutes * 60_000,
+        @alert_budget_per_swarm,
+        state.swarm_name,
+        now
+      )
+
+    state = %{state | pending_alerts: [], last_alert: new_last_alert}
+    state = Enum.reduce(emit, state, fn alert, st -> emit_alert(st, alert, %{}, now) end)
+
+    {state, length(emit), suppressed}
   end
 
   # Drain page budget: the server pages the feed (the client asks for 500
@@ -603,54 +606,12 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   # ── alerting: dedupe + cooldown, then card to :sender ─────────────────────
-
-  defp alert_key(alert), do: Map.get(alert, :key, {alert.swarm, alert.type})
-
-  defp cooled_down?(state, alert, now) do
-    window_ms = state.cooldown_minutes * 60_000
-
-    case Map.get(state.last_alert, alert_key(alert)) do
-      nil -> true
-      last_ms -> now - last_ms >= window_ms
-    end
-  end
-
-  # Caps how many cards one tick can emit for one swarm: a misbehaving
-  # swarm firing many distinct alert types in one tick must not flood
-  # :sender. Overflow collapses into one synthetic summary alert instead
-  # of being silently dropped. Returns `{alerts_to_emit, suppressed}`:
-  # the summary goes through the SAME `cooled_down?` gate as any other
-  # alert (its key is `{swarm, :alerts_coalesced}`, stamped into
-  # `last_alert` by `emit_alert/4` like everyone else's), so sustained
-  # overflow summarizes once per cooldown window — not once per tick.
-  defp apply_alert_budget(state, alerts, swarm, now_ms) do
-    if length(alerts) <= @alert_budget_per_swarm do
-      {alerts, 0}
-    else
-      {kept, dropped} = Enum.split(alerts, @alert_budget_per_swarm)
-
-      dropped_counts =
-        dropped
-        |> Enum.group_by(& &1.type)
-        |> Map.new(fn {type, list} -> {to_string(type), length(list)} end)
-
-      coalesced = %{
-        type: :alerts_coalesced,
-        swarm: swarm,
-        at_ms: now_ms,
-        summary: "#{length(dropped)} additional alert(s) suppressed by the per-tick budget",
-        evidence: %{"dropped" => dropped_counts},
-        key: {swarm, :alerts_coalesced},
-        cids: []
-      }
-
-      if cooled_down?(state, coalesced, now_ms) do
-        {kept ++ [coalesced], 0}
-      else
-        {kept, 1}
-      end
-    end
-  end
+  #
+  # Cooldown/dedupe/budget policy itself lives in the pure `Lifecycle`
+  # module (called from `tick/1` and `drain_pending_alerts/2`); this
+  # delegate keeps `alert_key/1` as a single home while letting the relay
+  # gate and `relay_counts` pruning below keep compiling unchanged.
+  defp alert_key(alert), do: Lifecycle.alert_key(alert)
 
   # ── digest (O4): conversation_topics extension → cards, seen-after-send ────
   #
@@ -907,8 +868,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     %{
       state
-      | last_alert: Map.put(state.last_alert, alert_key(alert), alert.at_ms),
-        alerts: alerts,
+      | alerts: alerts,
         # Relay budgets live only as long as their alert INSTANCE. Two
         # prunes, both needed:
         # - delete-on-emit: THIS alert already passed cooldown, so it is a
