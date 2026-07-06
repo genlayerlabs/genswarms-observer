@@ -526,6 +526,20 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Client.Fake.calls(fake) == []
   end
 
+  test "get_session_history with a non-binary swarm is dropped, never crashes" do
+    %{state: state, fake: fake} = start_scope()
+
+    # the diagnosis agent is an LLM assembling JSON — a map/list/number
+    # where the swarm string belongs must fall to the catch-all, not
+    # Protocol.UndefinedError inside to_string/1
+    for bad_swarm <- [%{}, [1, 2], 7, nil, true] do
+      msg = Jason.encode!(%{action: "get_session_history", swarm: bad_swarm, cid: "tg:1:0"})
+      assert {:noreply, _} = Scope.handle_message(:diagnostico, msg, state)
+    end
+
+    assert Client.Fake.calls(fake) == []
+  end
+
   test "reads on an unobserved swarm answer an error, never fetch" do
     %{state: state, fake: fake} = start_scope()
 

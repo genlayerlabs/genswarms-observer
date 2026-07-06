@@ -426,7 +426,7 @@ defmodule Genswarms.Observer.Objects.Scope do
           else: drop(from, "get_events", state)
 
       {:ok, %{"action" => "get_session_history", "swarm" => swarm, "cid" => cid}}
-      when is_binary(cid) ->
+      when is_binary(swarm) and is_binary(cid) ->
         if trusted?(from, state.read_sources),
           do: relay_session_history(from, swarm, cid, state),
           else: drop(from, "get_session_history", state)
