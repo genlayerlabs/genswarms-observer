@@ -155,6 +155,14 @@ defmodule Genswarms.Observer.Objects.Scope do
       # Nested per swarm, then per detector module: `det[swarm][module]`.
       # Isolates one detector's state from another's under DetectorRunner.
       det: %{},
+      # Per-swarm cursor into the observed swarm's display event feed
+      # (GET .../events/feed?since=N). Session-local by design, seeded 0,
+      # deliberately NOT persisted: on an observer restart the host's ring
+      # replays ascending from seq 1 and every already-answered
+      # request_open/reply_sent pair cancels out inside the feed detectors —
+      # a replay costs nothing, while a persisted-but-stale cursor against a
+      # restarted feed (seqs reset to 1) would need rollback bookkeeping.
+      feed_cursors: %{},
       last_alert: %{},
       # O4: unseen digest period ids per swarm. Persisted, validated on load.
       seen_periods: %{},
@@ -223,7 +231,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   defp merge_loaded(state, saved, now) do
-    loaded_seq = Map.get(saved, :save_seq, 0)
+    loaded_seq = validate_save_seq(Map.get(saved, :save_seq, 0))
     det = saved |> Map.get(:det, %{}) |> validate_det()
     last_alert = saved |> Map.get(:last_alert, %{}) |> validate_last_alert(now)
     seen_periods = saved |> Map.get(:seen_periods, %{}) |> validate_seen_periods(now)
@@ -259,10 +267,40 @@ defmodule Genswarms.Observer.Objects.Scope do
     }
   end
 
-  # det is opaque to Scope — kept as-is, only type-checked so a poisoned
-  # value can't crash DetectorRunner downstream.
-  defp validate_det(det) when is_map(det), do: det
+  # det is opaque to Scope BELOW the per-swarm level — but the two levels
+  # Scope/DetectorRunner navigate themselves are type-checked: the outer map
+  # AND each per-swarm value (DetectorRunner does `Map.get(states, mod, _)`
+  # on it — a non-map would BadMapError mid-tick). A poisoned per-swarm
+  # entry is dropped (that swarm's detectors restart from init/0), the rest
+  # is kept.
+  defp validate_det(det) when is_map(det) do
+    {valid, dropped} = Enum.split_with(det, fn {_swarm, per_swarm} -> is_map(per_swarm) end)
+
+    Enum.each(dropped, fn {swarm, value} ->
+      Logger.warning(
+        "[observer] store det[#{inspect(swarm)}] is not a map (#{inspect(value)}) — dropped, " <>
+          "that swarm's detectors restart fresh"
+      )
+    end)
+
+    Map.new(valid)
+  end
+
   defp validate_det(_), do: %{}
+
+  # save_seq feeds `persist/1`'s `+ 1` and the rollback comparison — a
+  # non-integer from a corrupt store must be neutralized HERE or the first
+  # dirty tick dies in persist arithmetic. Treated as 0 = "fresh boot"
+  # (0 never false-positives a rollback, see init/1).
+  defp validate_save_seq(seq) when is_integer(seq) and seq >= 0, do: seq
+
+  defp validate_save_seq(bad) do
+    Logger.warning(
+      "[observer] store save_seq #{inspect(bad)} is not a non-negative integer — treating as 0"
+    )
+
+    0
+  end
 
   defp validate_last_alert(map, now) when is_map(map) do
     Map.filter(map, fn {_key, at_ms} -> is_integer(at_ms) and at_ms <= now end)
@@ -430,7 +468,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     {state, fired, suppressed} =
       Enum.reduce(state.registry, {state, pending_fired, pending_suppressed}, fn {swarm, entry},
                                                                                   {st, fired, supp} ->
-        data = fetch(swarm, entry, st)
+        {data, st} = fetch(swarm, entry, st)
 
         st =
           st
@@ -503,14 +541,43 @@ defmodule Genswarms.Observer.Objects.Scope do
     end)
   end
 
+  # Returns `{data, state}`: `data` is what the detectors see
+  # (`%{dashboard:, events:, feed:}` — the `Detector.fetched` contract) and
+  # `state` carries the advanced per-swarm feed cursor. `feed` is already
+  # normalized here to `{:ok, [event]} | :unavailable | {:error, _}` — the
+  # seq is Scope's cursor bookkeeping, never a detector concern. On
+  # `:unavailable`/`{:error, _}` the cursor is untouched, so the missed
+  # window is re-read next tick. The returned seq is trusted verbatim
+  # (guarded for shape only): a seq BELOW our cursor means the feed
+  # restarted, and adopting it re-baselines us exactly as the EventsSource
+  # contract prescribes.
   defp fetch(swarm, entry, state) do
     token = resolve_token(entry)
     base = entry["dashboard_url"]
+    since = Map.get(state.feed_cursors, swarm, 0)
 
-    %{
+    {feed, state} =
+      case safe_client(state, :get_events_feed, [base, swarm, since, token, state.client_opts]) do
+        {:ok, %{events: events, seq: seq}} when is_list(events) and is_integer(seq) and seq >= 0 ->
+          {{:ok, events}, %{state | feed_cursors: Map.put(state.feed_cursors, swarm, seq)}}
+
+        :unavailable ->
+          {:unavailable, state}
+
+        {:error, reason} ->
+          {{:error, reason}, state}
+
+        other ->
+          {{:error, {:bad_feed_return, other}}, state}
+      end
+
+    data = %{
       dashboard: safe_client(state, :get_dashboard, [base, swarm, token, state.client_opts]),
-      events: safe_client(state, :get_events, [base, swarm, token, state.client_opts])
+      events: safe_client(state, :get_events, [base, swarm, token, state.client_opts]),
+      feed: feed
     }
+
+    {data, state}
   end
 
   # A crashing client must read as endpoint_down, never take the object down.
@@ -645,12 +712,16 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   @health_error_cap 500
 
-  # :fetch — both client calls of this tick's fetch. Any non-{:ok, _}
-  # (including a shape a buggy client invented) counts as a fetch error.
+  # :fetch — all client calls of this tick's fetch. Any non-{:ok, _}
+  # (including a shape a buggy client invented) counts as a fetch error —
+  # EXCEPT the feed's :unavailable, which is the wire's own fail-soft
+  # answer for "this host has no EventsSource" (plug.ex serves it as a
+  # 200, not an error): a healthy state, not a fetch failure.
   defp record_fetch_health(state, swarm, data, now) do
     errors =
       Enum.flat_map(data, fn
         {_part, {:ok, _}} -> []
+        {:feed, :unavailable} -> []
         {part, {:error, reason}} -> ["#{part}: #{health_error(reason)}"]
         {part, other} -> ["#{part}: malformed client return #{health_error(other)}"]
       end)

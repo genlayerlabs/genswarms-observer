@@ -3,18 +3,65 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
   alias Genswarms.Observer.Detectors.{DeliveryFailureBurst, TopicsStale, Unanswered}
 
-  # `iso/1` here takes an ABSOLUTE ms-since-epoch (matching the brief's
-  # `ev.(kind, cid, ms, extra)` helper), unlike detectors_test.exs's
-  # ms_ago-based helper — the brief's fixtures are written against a fixed
-  # epoch-relative timeline.
-  defp iso(ms), do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601()
+  # ── REAL feed wire shapes (ground truth for every fixture below) ──────────
+  #
+  # The UX detectors consume `fetched.feed` — the display-event feed served by
+  # `GET /api/swarms/:name/events/feed` (cursor read), NOT the engine LogStore
+  # `/events` surface. Two known hosts serve it:
+  #
+  # WINGSTON — wingstonrallybot/objects/event_feed.ex:164-177 (handle_cast):
+  #   event = meta |> json_safe_map() |> Map.put(:seq, seq)
+  #                |> Map.put(:ts, System.system_time(:millisecond) / 1000)
+  # Per-kind fields from the registry (objects/event_feed.ex:28-52):
+  #   request_open: cid · reply_sent: cid, ok, threaded · reply_failed: from
+  # The collector stores atom keys / stringified kind values; the dashboard
+  # backend Jason-encodes the maps verbatim and the observer client
+  # Jason.decodes — so on OUR side of the wire the keys are STRINGS and
+  # `"ts"` is a float of unix SECONDS.
+  #
+  # MICROMARKETS — micromarkets/dashboard/feed/event_feed.ex:317-329 (base/2),
+  # already string-keyed at the source:
+  #   %{"kind", "ts", "source" => "log_store", "log_id", "event_type",
+  #     "category", "message", "metadata"}
+  #   + per-kind extras: "cid"/"user" (request_open, :133-148), "ok"/"from"
+  #     (reply_sent, :253-276), "seq" stamped by ingest_log (:99-102).
+  #   "ts" via unix_ts/1 (:479-480) = DateTime.to_unix(:millisecond) / 1000 —
+  #   float unix SECONDS.
+  #
+  # Both swarms use the SAME key names for everything these detectors read:
+  # "kind", "cid", "ok", "ts". There is no per-swarm divergence to bridge —
+  # micromarkets just carries extra log-store bookkeeping keys, which the
+  # detectors must tolerate (app-opaque events, EventsSource contract).
 
+  # float unix seconds, as both feeds put on the wire
+  defp ts(ms), do: ms / 1000
+
+  # Minimal wingston-shaped feed event (provenance above).
   defp ev(kind, cid, ms, extra \\ %{}) do
-    Map.merge(%{"kind" => kind, "cid" => cid, "timestamp" => iso(ms)}, extra)
+    Map.merge(%{"kind" => kind, "cid" => cid, "seq" => 1, "ts" => ts(ms)}, extra)
   end
 
-  defp fetched(events, dashboard \\ %{}),
-    do: %{dashboard: {:ok, dashboard}, events: {:ok, events}}
+  # Full micromarkets-shaped feed event (provenance above).
+  defp mm_ev(kind, cid, ms, extra) do
+    Map.merge(
+      %{
+        "kind" => kind,
+        "cid" => cid,
+        "ts" => ts(ms),
+        "seq" => 1,
+        "source" => "log_store",
+        "log_id" => 42,
+        "event_type" => "telegram_reply",
+        "category" => "communication",
+        "message" => "delivered",
+        "metadata" => %{"conversation_id" => cid}
+      },
+      extra
+    )
+  end
+
+  defp fetched(feed_events, dashboard \\ %{}),
+    do: %{dashboard: {:ok, dashboard}, events: {:ok, []}, feed: {:ok, feed_events}}
 
   # ── Unanswered ─────────────────────────────────────────────────────────────
 
@@ -206,10 +253,10 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       assert new_state == state
     end
 
-    test "malformed timestamp on request_open is skipped; a later valid open for the same cid tracks normally" do
+    test "malformed ts on request_open is skipped; a later valid open for the same cid tracks normally" do
       f =
         fetched([
-          %{"kind" => "request_open", "cid" => "tg:1:0", "timestamp" => "not-a-timestamp"},
+          %{"kind" => "request_open", "cid" => "tg:1:0", "seq" => 1, "ts" => "not-a-number"},
           ev("request_open", "tg:1:0", 0)
         ])
 
@@ -224,6 +271,96 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       assert [%{type: :unanswered, cids: ["tg:1:0"]}] = alerts
       assert state["tg:1:0"].opened_ms == 0
+    end
+
+    test "micromarkets-shaped events (full log-store keys) track and clear identically" do
+      # Same behavioral case as "ok reply clears the cid", on the FULL
+      # micromarkets base/2 projection shape — the extra log-store keys
+      # ("source"/"log_id"/"event_type"/"category"/"message"/"metadata")
+      # must be tolerated, per the app-opaque EventsSource contract.
+      f =
+        fetched([
+          mm_ev("request_open", "tg:1:0", 0, %{"event_type" => "message_received", "user" => "al"}),
+          mm_ev("reply_sent", "tg:1:0", 60_000, %{"ok" => true, "from" => "agent_1"})
+        ])
+
+      ctx0 = %{
+        swarm: "mm",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], %{}} = Unanswered.detect(f, ctx0)
+    end
+
+    # F1: the feed can legitimately be absent — the host has no EventsSource
+    # (`source: "unavailable"`) or the read failed. Without the window we
+    # cannot know whether replies happened, so the only safe answer is a
+    # NO-OP with prior state: no scan, no alert, no state mutation.
+    test "feed :unavailable is a no-op with prior state (no false alert on a tracked cid)" do
+      state = %{"tg:1:0" => %{opened_ms: 0, alerted: false}}
+      f = %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: :unavailable}
+
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: state,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], ^state} = Unanswered.detect(f, ctx)
+    end
+
+    test "feed {:error, _} is a no-op with prior state" do
+      state = %{"tg:1:0" => %{opened_ms: 0, alerted: false}}
+      f = %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: {:error, :econnrefused}}
+
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: state,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], ^state} = Unanswered.detect(f, ctx)
+    end
+
+    test "a fetched map without a :feed key at all is a no-op with prior state" do
+      state = %{"tg:1:0" => %{opened_ms: 0, alerted: false}}
+      f = %{dashboard: {:ok, %{}}, events: {:ok, []}}
+
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: state,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], ^state} = Unanswered.detect(f, ctx)
+    end
+
+    # F2: the EventsSource contract guarantees oldest-first ascending
+    # (wingston vendor/genswarms-dashboard/backend README §EventsSource:
+    # "Events with seq > since, oldest first"), so fold order is correct by
+    # contract — but the detector sorts by "ts" as cheap insurance against a
+    # non-compliant host. A shuffled window (reply delivered BEFORE its open
+    # in list order) must not false-alert an answered pair.
+    test "a shuffled window does not false-alert an answered pair (defensive ts sort)" do
+      f =
+        fetched([
+          ev("reply_sent", "tg:1:0", 60_000, %{"ok" => true, "seq" => 2}),
+          ev("request_open", "tg:1:0", 0, %{"seq" => 1})
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], %{}} = Unanswered.detect(f, ctx0)
     end
   end
 
@@ -265,9 +402,11 @@ defmodule Genswarms.Observer.DetectorsUxTest do
     end
 
     test "reply_failed events (no cid) feed :reply_failed_burst only, never delivery_failure_burst" do
+      # wingston reply_failed carries `from`, never a cid — the target could
+      # not be resolved (objects/event_feed.ex:39).
       events =
         for ms <- [0, 100_000, 200_000] do
-          %{"kind" => "reply_failed", "timestamp" => iso(ms)}
+          %{"kind" => "reply_failed", "from" => "agent_3", "seq" => 1, "ts" => ts(ms)}
         end
 
       f = fetched(events)
@@ -303,6 +442,32 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
     test "default_thresholds exposes only its namespaced keys" do
       assert DeliveryFailureBurst.default_thresholds() == @thresholds
+    end
+
+    test "micromarkets-shaped failed replies (full log-store keys) burst identically" do
+      events =
+        for ms <- [0, 100_000, 200_000] do
+          mm_ev("reply_sent", "tg:2:0", ms, %{"ok" => false, "from" => "agent_1"})
+        end
+
+      f = fetched(events)
+      ctx = %{swarm: "mm", thresholds: @thresholds, state: nil, now_ms: 300_000}
+
+      {alerts, _state} = DeliveryFailureBurst.detect(f, ctx)
+
+      assert [%{type: :delivery_failure_burst, cids: ["tg:2:0"]}] = alerts
+    end
+
+    test "feed :unavailable / {:error, _} / missing key are no-ops with prior state" do
+      ctx = %{swarm: "w", thresholds: @thresholds, state: :prior, now_ms: 300_000}
+
+      for feedless <- [
+            %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: :unavailable},
+            %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: {:error, :timeout}},
+            %{dashboard: {:ok, %{}}, events: {:ok, []}}
+          ] do
+        assert {[], :prior} = DeliveryFailureBurst.detect(feedless, ctx)
+      end
     end
   end
 

@@ -15,7 +15,9 @@ defmodule Genswarms.Observer.DetectorRunner do
     the detector module that produced it — this is the provenance tag the
     caller (scope.ex) uses to decide builtin-vs-custom trust; it is set by
     the runner itself and is never taken from the detector's own return
-    value, so a detector cannot forge it.
+    value, so a detector cannot forge it. Evidence that Jason can't encode
+    (pids/tuples inside an otherwise-valid map) is replaced with a bounded
+    inspect, so the caller's `Jason.encode!` on it can never crash a tick.
 
   `states` and the returned states map are keyed by detector module.
   """
@@ -107,6 +109,27 @@ defmodule Genswarms.Observer.DetectorRunner do
     |> Map.put_new(:key, {swarm, alert.type})
     |> Map.put_new(:cids, [])
     |> Map.put(:source, mod)
+    |> ensure_encodable_evidence()
+  end
+
+  # Alert evidence is Jason.encode!'d downstream (scope.ex: alert_card,
+  # escalate, the coalesced-summary card) — a map-shaped evidence passes
+  # valid_alert?/1 but can still smuggle pids/refs/tuples in its VALUES,
+  # which would crash the whole tick at the encode. Sanitize at the
+  # normalization boundary: keep the alert, swap the evidence for a bounded
+  # inspect. Jason.encode/1 returns {:error, _} for these, but wrap the
+  # raise path too — this guard must never itself take the tick down.
+  defp ensure_encodable_evidence(alert) do
+    case Jason.encode(alert.evidence) do
+      {:ok, _} -> alert
+      {:error, _} -> replace_evidence(alert)
+    end
+  rescue
+    _ -> replace_evidence(alert)
+  end
+
+  defp replace_evidence(alert) do
+    %{alert | evidence: %{"unencodable" => inspect(alert.evidence, limit: 20, printable_limit: 500)}}
   end
 
   defp synthetic(type, mod, swarm, now_ms, reason) do

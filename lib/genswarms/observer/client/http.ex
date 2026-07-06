@@ -22,6 +22,31 @@ defmodule Genswarms.Observer.Client.Http do
   end
 
   @impl true
+  def get_events_feed(base_url, swarm, since, token, opts) do
+    case get_json("#{base_url}/api/swarms/#{swarm}/events/feed?since=#{since}", token, opts) do
+      {:ok, envelope} -> parse_feed_envelope(envelope)
+      error -> error
+    end
+  end
+
+  @doc """
+  Maps the feed wire envelope (vendored dashboard backend,
+  genswarms_dashboard/plug.ex events/feed route) onto the client contract:
+
+      %{"events" => [...], "seq" => n, "source" => "feed"}        -> {:ok, %{events, seq}}
+      %{"events" => [],    "seq" => 0, "source" => "unavailable"} -> :unavailable
+
+  Public so the envelope mapping is testable without an HTTP server.
+  """
+  def parse_feed_envelope(%{"source" => "unavailable"}), do: :unavailable
+
+  def parse_feed_envelope(%{"events" => events, "seq" => seq})
+      when is_list(events) and is_integer(seq) and seq >= 0,
+      do: {:ok, %{events: events, seq: seq}}
+
+  def parse_feed_envelope(other), do: {:error, {:bad_feed_envelope, other}}
+
+  @impl true
   def get_session_history(base_url, swarm, cid, token, opts) do
     get_json("#{base_url}/api/swarms/#{swarm}/sessions/#{URI.encode_www_form(cid)}/history", token, opts)
   end

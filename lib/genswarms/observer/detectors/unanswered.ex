@@ -3,17 +3,38 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
   Alerts when a `request_open` has no matching ok `reply_sent` within
   `"unanswered.minutes"`.
 
-  Event shapes (string-keyed, dashboard/MM wire): `%{"kind" => "request_open",
-  "cid" => c, "timestamp" => iso}`, `%{"kind" => "reply_sent", "cid" => c,
-  "ok" => bool, "timestamp" => iso}`. Either `"kind"` or `"event_type"` names
-  the event; a missing `"ok"` on `reply_sent` counts as delivered (`true`).
+  Consumes `fetched.feed` — the DISPLAY event feed
+  (`GET /api/swarms/:name/events/feed`), the only surface that carries the
+  `request_open`/`reply_sent` vocabulary. NOT `fetched.events` (engine-raw
+  LogStore), which the legacy health detectors keep.
+
+  Real wire event shape, identical across both known hosts (see the
+  provenance block in detectors_ux_test.exs):
+
+  - wingston `objects/event_feed.ex:164-177` — `%{kind, cid, ok?, seq, ts}`
+    with `ts = System.system_time(:millisecond) / 1000`; string keys after
+    the JSON hop.
+  - micromarkets `dashboard/feed/event_feed.ex:317-329` (`base/2`) —
+    `%{"kind", "cid", "ok"?, "seq", "ts", ...log-store extras}` with `"ts"`
+    from `unix_ts/1` (`:479-480`).
+
+  So on our side: `%{"kind" => "request_open", "cid" => c, "ts" => secs}`,
+  `%{"kind" => "reply_sent", "cid" => c, "ok" => bool, "ts" => secs}` —
+  `"ts"` is FLOAT UNIX SECONDS on both wires (no per-swarm divergence).
+  A missing `"ok"` on `reply_sent` counts as delivered (`true`).
+
+  `feed` `:unavailable` / `{:error, _}` / absent is a NO-OP with prior
+  state: without the window we cannot know whether replies happened, and a
+  false `:unanswered` on an answered pair is worse than a late one.
 
   State: `%{cid => %{opened_ms: integer, alerted: bool}}`. Events may arrive
   as an overlapping window across ticks — `request_open` only opens a cid
   the FIRST time it's seen (`Map.put_new/3`), so a re-delivered open in a
   later window neither resets the clock nor causes a second alert. An ok
   reply clears the cid entirely (a later re-open starts fresh). Once alerted,
-  a still-open cid is not re-alerted while it remains open.
+  a still-open cid is not re-alerted while it remains open. The feed cursor
+  itself is Scope's (session-local): after a restart the ring replays
+  ascending from 0 and every answered open/reply pair cancels out here.
   """
 
   @behaviour Genswarms.Observer.Detector
@@ -31,13 +52,30 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
 
   @impl true
   def detect(fetched, ctx) do
-    minutes = ctx.thresholds["unanswered.minutes"]
-    tracked = apply_events(events(fetched), ctx.state || %{})
+    case fetched do
+      %{feed: {:ok, events}} when is_list(events) ->
+        minutes = ctx.thresholds["unanswered.minutes"]
+        tracked = apply_events(sort_by_ts(events), ctx.state || %{})
 
-    {alerts, new_state} = scan(tracked, ctx.swarm, minutes, ctx.now_ms)
+        {alerts, new_state} = scan(tracked, ctx.swarm, minutes, ctx.now_ms)
 
-    {alerts, prune_stale_alerted(new_state, ctx.now_ms)}
+        {alerts, prune_stale_alerted(new_state, ctx.now_ms)}
+
+      # :unavailable / {:error, _} / no :feed key at all — no window, no
+      # verdict: no-op with prior state (see moduledoc).
+      _ ->
+        {[], ctx.state}
+    end
   end
+
+  # The EventsSource contract guarantees oldest-first ascending (wingston
+  # vendor/genswarms-dashboard/backend README §EventsSource: "Events with
+  # seq > since, oldest first"), so the fold below is order-correct BY
+  # CONTRACT. This sort is cheap insurance against a non-compliant host:
+  # folding a reply BEFORE its open would delete a not-yet-tracked cid and
+  # then false-alert the answered pair. Malformed-ts events sort first and
+  # are skipped by the fold anyway.
+  defp sort_by_ts(events), do: Enum.sort_by(events, &(event_ms(&1) || 0))
 
   defp prune_stale_alerted(tracked, now_ms) do
     tracked
@@ -46,9 +84,6 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     end)
     |> Map.new()
   end
-
-  defp events(%{events: {:ok, events}}) when is_list(events), do: events
-  defp events(_), do: []
 
   defp apply_events(events, tracked) do
     Enum.reduce(events, tracked, fn ev, acc ->
@@ -103,14 +138,16 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     }
   end
 
-  defp kind(ev), do: ev["kind"] || ev["event_type"]
+  # Feed events name themselves via "kind" on both wires (wingston event
+  # registry / micromarkets base/2). No "event_type" fallback: on the
+  # micromarkets wire that key carries the RAW log type ("telegram_reply",
+  # "message_received", ...), never the display vocabulary.
+  defp kind(ev) when is_map(ev), do: ev["kind"]
+  defp kind(_), do: nil
 
-  defp event_ms(%{"timestamp" => ts}) when is_binary(ts) do
-    case DateTime.from_iso8601(ts) do
-      {:ok, dt, _offset} -> DateTime.to_unix(dt, :millisecond)
-      _ -> nil
-    end
-  end
-
+  # "ts" = float unix SECONDS on both wires (wingston event_feed.ex:171,
+  # micromarkets event_feed.ex:479-480) — the feed carries no ISO8601
+  # "timestamp"; that field belongs to the LogStore /events surface.
+  defp event_ms(%{"ts" => ts}) when is_number(ts), do: round(ts * 1000)
   defp event_ms(_), do: nil
 end

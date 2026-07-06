@@ -8,6 +8,7 @@ defmodule Genswarms.Observer.Client.Fake do
         "wingston" => %{
           dashboard: {:ok, envelope_map},
           events: {:ok, [event_map]},
+          events_feed: {:ok, %{events: [display_event_map], seq: 7}},
           session_history: %{"tg:1:0" => {:ok, %{"turns" => [...]}}}
         }
       })
@@ -20,6 +21,14 @@ defmodule Genswarms.Observer.Client.Fake do
   `session_history` is keyed one level deeper, by `cid` (unlike `dashboard`/
   `events`, which take no extra argument) — an unconfigured cid answers the
   same `{:error, :not_configured}` fallback.
+
+  `events_feed` mirrors the real wire's fail-soft envelope: a CONFIGURED
+  swarm without the key answers `:unavailable` (a live dashboard whose host
+  never wired an EventsSource — plug.ex serves `source: "unavailable"`, not
+  an error), while an unknown swarm still answers `{:error, :not_configured}`
+  (a dead endpoint fails every route). The fixture value may also be a
+  1-arity fun of `since`, for cursor-threading tests; each call records
+  `since` in `calls/1`.
   """
 
   @behaviour Genswarms.Observer.Client
@@ -41,6 +50,33 @@ defmodule Genswarms.Observer.Client.Fake do
 
   @impl true
   def get_events(_base_url, swarm, token, opts), do: answer(swarm, :events, token, opts)
+
+  @impl true
+  def get_events_feed(_base_url, swarm, since, token, opts) do
+    pid = Keyword.fetch!(opts, :fake)
+
+    Agent.get_and_update(pid, fn state ->
+      call = %{swarm: swarm, kind: :events_feed, since: since, token: token}
+
+      reply =
+        case Map.fetch(state.fixture, swarm) do
+          # unknown swarm = dead endpoint: every route fails
+          :error -> {:error, :not_configured}
+          {:ok, swarm_fixture} -> feed_reply(swarm_fixture, since)
+        end
+
+      {reply, %{state | calls: [call | state.calls]}}
+    end)
+  end
+
+  defp feed_reply(swarm_fixture, since) do
+    case Map.get(swarm_fixture, :events_feed) do
+      # configured swarm, no feed fixture = host without an EventsSource
+      nil -> :unavailable
+      fun when is_function(fun, 1) -> fun.(since)
+      result -> result
+    end
+  end
 
   @impl true
   def get_session_history(_base_url, swarm, cid, token, opts) do

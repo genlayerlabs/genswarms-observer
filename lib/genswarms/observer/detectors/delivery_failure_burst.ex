@@ -11,11 +11,22 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     `cid` — a `reply_sent` NOT tied to any request) inside the same window
     -> `:reply_failed_burst`, no cids.
 
+  Consumes `fetched.feed` (`GET /api/swarms/:name/events/feed`) — the only
+  surface carrying `reply_sent`/`reply_failed`. Real wire shape (identical
+  on both known hosts; full provenance in detectors_ux_test.exs):
+  `%{"kind" => k, "cid" => c?, "ok" => bool?, "ts" => float unix SECONDS}` —
+  wingston `objects/event_feed.ex:164-177` (+ registry `:38-39`),
+  micromarkets `dashboard/feed/event_feed.ex:317-329` (`"ts"` via `:479-480`).
+
   A missing `"ok"` on `reply_sent` counts as delivered (does not count
-  towards the burst). Either `"kind"` or `"event_type"` names the event.
+  towards the burst). `"kind"` names the event on both wires.
+
+  `feed` `:unavailable` / `{:error, _}` / absent is a no-op with prior
+  state — no window, no verdict.
 
   Stateless: recomputed fresh from the fetched event window every tick, so
-  `ctx.state` passes through unchanged.
+  `ctx.state` passes through unchanged. Window filtering is count-based and
+  order-insensitive, so unlike `Unanswered` no defensive sort is needed.
   """
 
   @behaviour Genswarms.Observer.Detector
@@ -29,25 +40,26 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
 
   @impl true
   def detect(fetched, ctx) do
-    count_threshold = ctx.thresholds["delivery_failure.count"]
-    window_s = ctx.thresholds["delivery_failure.window_s"]
-    window_ms = window_s * 1_000
+    case fetched do
+      %{feed: {:ok, events}} when is_list(events) ->
+        count_threshold = ctx.thresholds["delivery_failure.count"]
+        window_s = ctx.thresholds["delivery_failure.window_s"]
+        window_ms = window_s * 1_000
 
-    recent =
-      fetched
-      |> events()
-      |> Enum.filter(&within_window?(&1, ctx.now_ms, window_ms))
+        recent = Enum.filter(events, &within_window?(&1, ctx.now_ms, window_ms))
 
-    cid_alerts = cid_burst_alerts(recent, ctx.swarm, ctx.now_ms, count_threshold, window_s)
+        cid_alerts = cid_burst_alerts(recent, ctx.swarm, ctx.now_ms, count_threshold, window_s)
 
-    swarm_alerts =
-      reply_failed_burst_alerts(recent, ctx.swarm, ctx.now_ms, count_threshold, window_s)
+        swarm_alerts =
+          reply_failed_burst_alerts(recent, ctx.swarm, ctx.now_ms, count_threshold, window_s)
 
-    {cid_alerts ++ swarm_alerts, ctx.state}
+        {cid_alerts ++ swarm_alerts, ctx.state}
+
+      # :unavailable / {:error, _} / no :feed key — no window, no verdict.
+      _ ->
+        {[], ctx.state}
+    end
   end
-
-  defp events(%{events: {:ok, events}}) when is_list(events), do: events
-  defp events(_), do: []
 
   defp within_window?(ev, now_ms, window_ms) do
     case event_ms(ev) do
@@ -95,14 +107,12 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     end
   end
 
-  defp kind(ev), do: ev["kind"] || ev["event_type"]
+  # "kind" on both wires; no "event_type" fallback — see Unanswered.kind/1.
+  defp kind(ev) when is_map(ev), do: ev["kind"]
+  defp kind(_), do: nil
 
-  defp event_ms(%{"timestamp" => ts}) when is_binary(ts) do
-    case DateTime.from_iso8601(ts) do
-      {:ok, dt, _offset} -> DateTime.to_unix(dt, :millisecond)
-      _ -> nil
-    end
-  end
-
+  # "ts" = float unix SECONDS on both wires (wingston event_feed.ex:171,
+  # micromarkets event_feed.ex:479-480).
+  defp event_ms(%{"ts" => ts}) when is_number(ts), do: round(ts * 1000)
   defp event_ms(_), do: nil
 end

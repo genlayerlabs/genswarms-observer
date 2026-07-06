@@ -76,6 +76,37 @@ defmodule DetectorRunnerTest do
     assert Enum.any?(alerts, &(&1.type == :good))
   end
 
+  defmodule UnencodableEvidence do
+    @behaviour Genswarms.Observer.Detector
+
+    # evidence is a map (passes valid_alert?) but its VALUES can't survive
+    # Jason — a pid and an engine backend-spec tuple, exactly the kind of
+    # host value a custom detector leaks by accident.
+    def detect(_f, ctx) do
+      {[
+         %{
+           type: :weird,
+           swarm: ctx.swarm,
+           at_ms: ctx.now_ms,
+           summary: "weird evidence",
+           evidence: %{"pid" => self(), "spec" => {:bwrap, %{}}}
+         }
+       ], ctx.state}
+    end
+  end
+
+  test "unencodable evidence is replaced with a bounded inspect — downstream Jason.encode! stays safe" do
+    {alerts, _states, health} =
+      DetectorRunner.run([UnencodableEvidence], @fetched, "w", %{}, %{}, 1000)
+
+    assert [%{type: :weird, evidence: evidence}] = alerts
+    # the invariant scope.ex relies on (alert_card / escalate Jason.encode!)
+    assert {:ok, _} = Jason.encode(evidence)
+    assert evidence["unencodable"] =~ "bwrap"
+    # sanitized, not dropped — the detector itself ran fine
+    assert [%{module: UnencodableEvidence, ok: true}] = health
+  end
+
   test "malformed alerts dropped, state NOT committed" do
     {alerts, states, _} =
       DetectorRunner.run([Malformed], @fetched, "w", %{}, %{Malformed => %{poisoned: false}}, 1000)

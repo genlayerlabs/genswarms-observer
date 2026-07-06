@@ -245,6 +245,124 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Jason.decode!(delivery.content)["card"]["title"] =~ "endpoint_down"
   end
 
+  # ── events feed (F1): cursor fetch + UX-detector wiring ──────────────────
+
+  # Wingston-shaped feed event as the observer client sees it after
+  # Jason.decode — objects/event_feed.ex:164-177 stores
+  # `meta |> json_safe_map() |> Map.put(:seq, seq) |> Map.put(:ts, ms/1000)`,
+  # string keys on the wire, "ts" in float unix SECONDS.
+  defp feed_event(kind, cid, ms, extra \\ %{}) do
+    Map.merge(%{"kind" => kind, "cid" => cid, "seq" => 1, "ts" => ms / 1000}, extra)
+  end
+
+  test "feed events drive the Unanswered detector through a real tick" do
+    open = feed_event("request_open", "tg:9:0", @t0 - 20 * 60_000)
+
+    %{state: state, outbox: outbox} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, {:ok, %{events: [open], seq: 1}})
+        }
+      )
+
+    {reply, _state} = decode_reply(tick(state))
+    assert reply["alerts"] == 1
+
+    [delivery] = sent(outbox)
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "unanswered"
+  end
+
+  test "tick fetches the feed with the session cursor, seeded 0, advancing to the returned seq" do
+    %{state: state, fake: fake, clock: clock} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, fn since ->
+              {:ok, %{events: [], seq: since + 7}}
+            end)
+        }
+      )
+
+    {_, state} = decode_reply(tick(state))
+    advance(clock, 60_000)
+    {_, state} = decode_reply(tick(state))
+
+    assert state.feed_cursors == %{"wingston" => 14}
+
+    sinces = for %{kind: :events_feed, since: s} <- Client.Fake.calls(fake), do: s
+    assert sinces == [0, 7]
+  end
+
+  test "the cursor survives feed :unavailable and {:error, _} answers unchanged" do
+    %{state: state, fake: fake, clock: clock} =
+      start_scope(
+        fixture: %{
+          "wingston" => Map.put(healthy_fixture(), :events_feed, {:ok, %{events: [], seq: 5}})
+        }
+      )
+
+    {_, state} = decode_reply(tick(state))
+    assert state.feed_cursors == %{"wingston" => 5}
+
+    Client.Fake.put(fake, "wingston", Map.put(healthy_fixture(), :events_feed, {:error, :boom}))
+    advance(clock, 60_000)
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+    assert state.feed_cursors == %{"wingston" => 5}
+
+    Client.Fake.put(fake, "wingston", healthy_fixture())
+    advance(clock, 60_000)
+    {_, state} = decode_reply(tick(state))
+    assert state.feed_cursors == %{"wingston" => 5}
+
+    sinces = for %{kind: :events_feed, since: s} <- Client.Fake.calls(fake), do: s
+    assert sinces == [0, 5, 5]
+  end
+
+  test "a malformed feed seq from a buggy client never poisons the cursor" do
+    %{state: state} =
+      start_scope(
+        fixture: %{
+          "wingston" =>
+            Map.put(healthy_fixture(), :events_feed, {:ok, %{events: [], seq: "nine"}})
+        }
+      )
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+    assert state.feed_cursors == %{}
+  end
+
+  test "feed :unavailable keeps the fetch stage healthy (a host without an EventsSource is not an error)" do
+    # healthy_fixture/0 has no :events_feed — the Fake answers :unavailable,
+    # exactly like a dashboard whose host never wired an EventsSource.
+    %{state: state} = start_scope()
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+
+    health = status_health(state)["wingston"]
+    assert health["fetch"]["last_error"] == nil
+    assert health["fetch"]["last_success_ms"] == @t0
+  end
+
+  test "feed {:error, _} marks the fetch stage errored but the tick completes" do
+    %{state: state} =
+      start_scope(
+        fixture: %{
+          "wingston" => Map.put(healthy_fixture(), :events_feed, {:error, :feed_exploded})
+        }
+      )
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+
+    health = status_health(state)["wingston"]
+    assert health["fetch"]["last_error"] =~ "feed"
+    assert health["fetch"]["last_error"] =~ "feed_exploded"
+  end
+
   # ── per-swarm alert budget ────────────────────────────────────────────────
 
   test "a swarm firing more than the per-tick budget gets the overflow coalesced into one alert" do

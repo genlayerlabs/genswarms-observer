@@ -9,9 +9,25 @@ defmodule Genswarms.Observer.Detector do
   own failure.
   """
 
+  @typedoc """
+  One tick's fetch of the observed swarm, as assembled by `Objects.Scope`:
+
+  - `:dashboard` — `GET /api/swarms/:name/dashboard` envelope.
+  - `:events` — `GET /api/swarms/:name/events`, the engine-raw LogStore
+    surface (string keys, ISO8601 `"timestamp"`). Consumed by the legacy
+    health detectors (`Genswarms.Observer.Detectors`).
+  - `:feed` — `GET /api/swarms/:name/events/feed`, the host's DISPLAY event
+    feed (cursor read; Scope threads the per-swarm cursor). This is where
+    the `request_open`/`reply_sent`/... vocabulary lives — string keys,
+    `"ts"` float unix seconds. `:unavailable` mirrors the wire's
+    `source: "unavailable"` (host has no EventsSource — legitimate, not an
+    error); detectors consuming the feed must treat `:unavailable` and
+    `{:error, _}` as a no-op with prior state.
+  """
   @type fetched :: %{
           dashboard: {:ok, map} | {:error, term},
-          events: {:ok, [map]} | {:error, term}
+          events: {:ok, [map]} | {:error, term},
+          feed: {:ok, [map]} | :unavailable | {:error, term}
         }
 
   @type ctx :: %{swarm: String.t(), thresholds: map, state: term, now_ms: integer}

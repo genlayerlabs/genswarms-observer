@@ -235,6 +235,77 @@ defmodule Genswarms.Observer.StoreTest do
     assert state.pending_alerts == []
   end
 
+  # ── poisoned store payloads (F3): deep-validated, never crash boot/tick ──
+
+  test "a corrupt per-swarm det value is dropped at boot; boot and tick run clean" do
+    {name, pid} = fresh_store()
+
+    Agent.update(pid, fn _ ->
+      {:ok,
+       %{
+         det: %{"wingston" => :corrupt, "healthy" => %{}},
+         last_alert: %{},
+         seen_periods: %{},
+         save_seq: 0
+       }}
+    end)
+
+    %{state: state, outbox: outbox} = start_scope(name)
+    assert state.det == %{"healthy" => %{}}
+
+    # the tick must run the detectors for wingston from a fresh (empty)
+    # per-swarm state, not crash on the poisoned one
+    {reply, _state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+    assert reply["alerts"] == 1
+    assert length(sent(outbox)) == 1
+  end
+
+  test "a non-map det from the store boots empty" do
+    {name, pid} = fresh_store()
+
+    Agent.update(pid, fn _ ->
+      {:ok, %{det: [:not, :a, :map], last_alert: %{}, seen_periods: %{}, save_seq: 0}}
+    end)
+
+    %{state: state} = start_scope(name)
+    assert state.det == %{}
+  end
+
+  test "a non-integer save_seq is treated as 0 and never reaches persist arithmetic" do
+    {name, pid} = fresh_store()
+
+    Agent.update(pid, fn _ ->
+      {:ok, %{det: %{}, last_alert: %{}, seen_periods: %{}, save_seq: "12"}}
+    end)
+
+    %{state: state} = start_scope(name)
+    assert state.save_seq == 0
+
+    # this tick emits endpoint_down (mutating det/last_alert) -> persist runs
+    # save_seq + 1 — with the poisoned value it would ArithmeticError here
+    {reply, state} = decode_reply(tick(state))
+    assert reply["alerts"] == 1
+    assert state.save_seq == 1
+  end
+
+  test "a negative save_seq is treated as 0" do
+    {name, pid} = fresh_store()
+
+    Agent.update(pid, fn _ ->
+      {:ok, %{det: %{}, last_alert: %{}, seen_periods: %{}, save_seq: -4}}
+    end)
+
+    %{state: state} = start_scope(name)
+    assert state.save_seq == 0
+    # a poisoned seq must read as "fresh boot", not as a rollback
+    assert state.pending_alerts == []
+
+    {reply, state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+    assert state.save_seq == 1
+  end
+
   # ── fail-open on a raising store ──────────────────────────────────────────
 
   test "a raising store on load never crashes init — boots empty and logs" do
