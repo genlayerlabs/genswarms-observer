@@ -21,6 +21,11 @@ defmodule Genswarms.Observer.Client.Http do
     end
   end
 
+  @impl true
+  def get_session_history(base_url, swarm, cid, token, opts) do
+    get_json("#{base_url}/api/swarms/#{swarm}/sessions/#{URI.encode_www_form(cid)}/history", token, opts)
+  end
+
   defp get_json(url, token, opts) do
     timeout = Keyword.get(opts, :timeout_ms, 5_000)
 

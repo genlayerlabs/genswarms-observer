@@ -7,7 +7,8 @@ defmodule Genswarms.Observer.Client.Fake do
       {:ok, pid} = Client.Fake.start_link(%{
         "wingston" => %{
           dashboard: {:ok, envelope_map},
-          events: {:ok, [event_map]}
+          events: {:ok, [event_map]},
+          session_history: %{"tg:1:0" => {:ok, %{"turns" => [...]}}}
         }
       })
 
@@ -15,6 +16,10 @@ defmodule Genswarms.Observer.Client.Fake do
   Mutate mid-test with `put/3`; inspect what Scope asked for with `calls/1`.
   An unknown swarm answers `{:error, :not_configured}` — indistinguishable
   from a dead endpoint, which is exactly what endpoint_down should see.
+
+  `session_history` is keyed one level deeper, by `cid` (unlike `dashboard`/
+  `events`, which take no extra argument) — an unconfigured cid answers the
+  same `{:error, :not_configured}` fallback.
   """
 
   @behaviour Genswarms.Observer.Client
@@ -36,6 +41,23 @@ defmodule Genswarms.Observer.Client.Fake do
 
   @impl true
   def get_events(_base_url, swarm, token, opts), do: answer(swarm, :events, token, opts)
+
+  @impl true
+  def get_session_history(_base_url, swarm, cid, token, opts) do
+    pid = Keyword.fetch!(opts, :fake)
+
+    Agent.get_and_update(pid, fn state ->
+      call = %{swarm: swarm, kind: :session_history, cid: cid, token: token}
+
+      reply =
+        case get_in(state.fixture, [swarm, :session_history, cid]) do
+          nil -> {:error, :not_configured}
+          result -> result
+        end
+
+      {reply, %{state | calls: [call | state.calls]}}
+    end)
+  end
 
   defp answer(swarm, kind, token, opts) do
     pid = Keyword.fetch!(opts, :fake)

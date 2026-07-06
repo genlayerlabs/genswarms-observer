@@ -17,4 +17,18 @@ defmodule Genswarms.Observer.Client do
 
   @callback get_events(base_url :: String.t(), swarm :: String.t(), token :: String.t() | nil, opts) ::
               {:ok, [map()]} | {:error, term()}
+
+  @doc """
+  Fase 3 (O6): one conversation's transcript, for the diagnosis relay.
+  `cid` is form-encoded into the path by the implementation — callers pass
+  the raw cid. This is the narrowest read the client exposes; `Objects.Scope`
+  is what binds it to an alert-derived allowlist, not this seam.
+  """
+  @callback get_session_history(
+              base_url :: String.t(),
+              swarm :: String.t(),
+              cid :: String.t(),
+              token :: String.t() | nil,
+              opts
+            ) :: {:ok, map()} | {:error, term()}
 end
