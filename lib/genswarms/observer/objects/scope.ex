@@ -57,7 +57,12 @@ defmodule Genswarms.Observer.Objects.Scope do
       deliver_fn: cfg(config, :deliver_fn, default_deliver_fn(swarm_name)),
       # Built-ins today; custom detector registration (per-swarm scoped,
       # boot-time only, never x-mutable) lands in O5. NOT read from config.
-      detectors: [Detectors],
+      detectors: [
+        Detectors,
+        Genswarms.Observer.Detectors.Unanswered,
+        Genswarms.Observer.Detectors.DeliveryFailureBurst,
+        Genswarms.Observer.Detectors.TopicsStale
+      ],
       # Nested per swarm, then per detector module: `det[swarm][module]`.
       # Isolates one detector's state from another's under DetectorRunner.
       det: %{},
