@@ -9,10 +9,16 @@ defmodule Genswarms.Observer.Objects.Scope do
   - Tokens enter as env-var NAMES (`token_env`, x-secret contract §14.2.1)
     and are resolved at fetch time — never stored in config, state dumps are
     still safe because the resolved value never leaves the fetch closure.
-  - Detection is `Genswarms.Observer.Detectors` — pure, deterministic, no LLM.
-  - Dedupe + cooldown per `{swarm, type}` lives here (wingston roster
-    pattern): a persisting condition alerts once per cooldown window, not
-    once per tick.
+  - Detection runs through `DetectorRunner`, over `state.detectors`
+    (`Genswarms.Observer.Detectors` plus, from O5, any registered custom
+    detectors) — pure, deterministic, no LLM. Each detector's state is
+    isolated per `{swarm, module}` — a crash or malformed return in one
+    detector never corrupts another's state or stops the tick.
+  - Dedupe + cooldown per alert `key` (default `{swarm, type}`, wingston
+    roster pattern) lives here: a persisting condition alerts once per
+    cooldown window, not once per tick. A per-swarm-per-tick alert budget
+    (default 6) caps how many cards one tick can emit for one swarm;
+    overflow collapses into a single `:alerts_coalesced` summary alert.
 
   Actions (all allowlisted, fail-closed — empty list means nobody):
   - `tick` (tick_sources, normally just cron): fetch + detect + alert.
@@ -22,10 +28,12 @@ defmodule Genswarms.Observer.Objects.Scope do
   """
 
   alias Genswarms.Observer.Detectors
+  alias Genswarms.Observer.DetectorRunner
 
   require Logger
 
   @alerts_kept 50
+  @alert_budget_per_swarm 6
 
   # ── init ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +55,11 @@ defmodule Genswarms.Observer.Objects.Scope do
       client_opts: cfg(config, :client_opts, []),
       now_fn: cfg(config, :now_fn, fn -> System.system_time(:millisecond) end),
       deliver_fn: cfg(config, :deliver_fn, default_deliver_fn(swarm_name)),
+      # Built-ins today; custom detector registration (per-swarm scoped,
+      # boot-time only, never x-mutable) lands in O5. NOT read from config.
+      detectors: [Detectors],
+      # Nested per swarm, then per detector module: `det[swarm][module]`.
+      # Isolates one detector's state from another's under DetectorRunner.
       det: %{},
       last_alert: %{},
       last_tick_ms: nil,
@@ -130,19 +143,27 @@ defmodule Genswarms.Observer.Objects.Scope do
     {state, fired, suppressed} =
       Enum.reduce(state.registry, {state, 0, 0}, fn {swarm, entry}, {st, fired, supp} ->
         data = fetch(swarm, entry, st)
+        swarm_det_states = Map.get(st.det, swarm, %{})
 
-        {alerts, det_state} =
-          Detectors.detect(swarm, data, st.thresholds, Map.get(st.det, swarm), now)
+        {alerts, swarm_det_states, _health} =
+          DetectorRunner.run(st.detectors, data, swarm, st.thresholds, swarm_det_states, now)
 
-        st = %{st | det: Map.put(st.det, swarm, det_state)}
+        st = %{st | det: Map.put(st.det, swarm, swarm_det_states)}
 
-        Enum.reduce(alerts, {st, fired, supp}, fn alert, {st, fired, supp} ->
-          if cooled_down?(st, alert, now) do
-            {emit_alert(st, alert, entry), fired + 1, supp}
-          else
-            {st, fired, supp + 1}
-          end
-        end)
+        {passed, supp} =
+          Enum.reduce(alerts, {[], supp}, fn alert, {passed, supp} ->
+            if cooled_down?(st, alert, now) do
+              {[alert | passed], supp}
+            else
+              {passed, supp + 1}
+            end
+          end)
+
+        budgeted = apply_alert_budget(Enum.reverse(passed), swarm, now)
+
+        st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry) end)
+
+        {st, fired + length(budgeted), supp}
       end)
 
     state = %{state | last_tick_ms: now}
@@ -190,12 +211,43 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   # ── alerting: dedupe + cooldown, then card to :sender ─────────────────────
 
+  defp alert_key(alert), do: Map.get(alert, :key, {alert.swarm, alert.type})
+
   defp cooled_down?(state, alert, now) do
     window_ms = state.cooldown_minutes * 60_000
 
-    case Map.get(state.last_alert, {alert.swarm, alert.type}) do
+    case Map.get(state.last_alert, alert_key(alert)) do
       nil -> true
       last_ms -> now - last_ms >= window_ms
+    end
+  end
+
+  # Caps how many cards one tick can emit for one swarm: a misbehaving
+  # swarm firing many distinct alert types in one tick must not flood
+  # :sender. Overflow collapses into one synthetic summary alert instead
+  # of being silently dropped.
+  defp apply_alert_budget(alerts, swarm, now_ms) do
+    if length(alerts) <= @alert_budget_per_swarm do
+      alerts
+    else
+      {kept, dropped} = Enum.split(alerts, @alert_budget_per_swarm)
+
+      dropped_counts =
+        dropped
+        |> Enum.group_by(& &1.type)
+        |> Map.new(fn {type, list} -> {to_string(type), length(list)} end)
+
+      coalesced = %{
+        type: :alerts_coalesced,
+        swarm: swarm,
+        at_ms: now_ms,
+        summary: "#{length(dropped)} additional alert(s) suppressed by the per-tick budget",
+        evidence: %{"dropped" => dropped_counts},
+        key: {swarm, :alerts_coalesced},
+        cids: []
+      }
+
+      kept ++ [coalesced]
     end
   end
 
@@ -223,7 +275,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     %{
       state
-      | last_alert: Map.put(state.last_alert, {alert.swarm, alert.type}, alert.at_ms),
+      | last_alert: Map.put(state.last_alert, alert_key(alert), alert.at_ms),
         alerts: Enum.take([alert | state.alerts], @alerts_kept)
     }
   end

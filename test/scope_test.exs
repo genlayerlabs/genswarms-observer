@@ -209,6 +209,45 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Jason.decode!(delivery.content)["card"]["title"] =~ "endpoint_down"
   end
 
+  # ── per-swarm alert budget ────────────────────────────────────────────────
+
+  test "a swarm firing more than the per-tick budget gets the overflow coalesced into one alert" do
+    defmodule ManyAlertsDetector do
+      @behaviour Genswarms.Observer.Detector
+
+      def detect(_fetched, ctx) do
+        alerts =
+          for i <- 1..8 do
+            %{
+              type: :"synthetic_#{i}",
+              swarm: ctx.swarm,
+              at_ms: ctx.now_ms,
+              summary: "alert #{i}",
+              evidence: %{}
+            }
+          end
+
+        {alerts, ctx.state}
+      end
+    end
+
+    %{state: state, outbox: outbox} = start_scope()
+    state = %{state | detectors: [ManyAlertsDetector]}
+
+    {reply, _state} = decode_reply(tick(state))
+    # 6 kept + 1 synthetic :alerts_coalesced summary for the other 2
+    assert reply["alerts"] == 7
+
+    cards = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+    assert length(cards) == 7
+    assert Enum.count(cards, &(&1["card"]["title"] =~ "alerts_coalesced")) == 1
+
+    [coalesced] = Enum.filter(cards, &(&1["card"]["title"] =~ "alerts_coalesced"))
+    evidence_text = Enum.find(coalesced["card"]["blocks"], &(&1["text"] =~ "evidence"))["text"]
+    assert evidence_text =~ "synthetic_7"
+    assert evidence_text =~ "synthetic_8"
+  end
+
   # ── escalation (fase 3) ───────────────────────────────────────────────────
 
   test "with escalate_to set, an emitted alert also becomes a diagnosis task" do
