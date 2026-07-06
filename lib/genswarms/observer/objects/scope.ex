@@ -63,6 +63,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   alias Genswarms.Observer.Detectors
   alias Genswarms.Observer.DetectorRunner
   alias Genswarms.Observer.Digest
+  alias Genswarms.Observer.Ingest
 
   require Logger
 
@@ -473,7 +474,12 @@ defmodule Genswarms.Observer.Objects.Scope do
     {state, fired, suppressed} =
       Enum.reduce(state.registry, {state, pending_fired, pending_suppressed}, fn {swarm, entry},
                                                                                   {st, fired, supp} ->
-        {data, st} = fetch(swarm, entry, st)
+        {data, proposed_cursor, st} = fetch(swarm, entry, st)
+
+        st =
+          if is_integer(proposed_cursor),
+            do: %{st | feed_cursors: Map.put(st.feed_cursors, swarm, proposed_cursor)},
+            else: st
 
         st =
           st
@@ -546,102 +552,26 @@ defmodule Genswarms.Observer.Objects.Scope do
     end)
   end
 
-  # First-read drain page budget: the server pages the feed (the client asks
-  # for 500 per page, and a host may clamp lower — micromarkets caps limit at
-  # 1_000 while its ring holds 5_000, so "one huge first read" is NOT
-  # reliably achievable). 10 pages × 500 = 5_000 covers both known rings
-  # (wingston 4_096, micromarkets 5_000) while bounding a pathological feed.
-  @feed_first_read_max_pages 10
+  # Drain page budget: the server pages the feed (the client asks for 500
+  # per page, and a host may clamp lower — micromarkets caps limit at 1_000
+  # while its ring holds 5_000, so "one huge read" is NOT reliably
+  # achievable). 10 pages × 500 = 5_000 covers both known rings (wingston
+  # 4_096, micromarkets 5_000) while bounding a pathological feed. Bounds
+  # EVERY read, not just the first — see Ingest's moduledoc (F5):
+  # steady-state reads drain to head exactly like the first read.
+  @feed_max_pages 10
 
-  # Returns `{data, state}`: `data` is what the detectors see
-  # (`%{dashboard:, events:, feed:}` — the `Detector.fetched` contract) and
-  # `state` carries the advanced per-swarm feed cursor. `feed` is already
-  # normalized here to `{:ok, [event]} | :unavailable | {:error, _}` — the
-  # seq is Scope's cursor bookkeeping, never a detector concern. On
-  # `:unavailable`/`{:error, _}` the cursor is untouched, so the missed
-  # window is re-read next tick. The returned seq is trusted verbatim
-  # (guarded for shape only): a seq BELOW our cursor means the feed
-  # restarted, and adopting it re-baselines us exactly as the EventsSource
-  # contract prescribes.
-  #
-  # THE FIRST read per swarm (no cursor yet — observer restart or first
-  # boot) DRAINS the feed to head and hands the detectors the whole backlog
-  # as ONE batch. The ring replays in server-sized pages: if an old
-  # request_open sits in page N and its ok reply in page N+1, a single-page
-  # first read would false-alert the answered pair on tick 1 before tick 2
-  # ever saw the reply. Draining lets answered pairs cancel inside one
-  # detect/2 while a genuinely-unanswered old request still alerts.
+  # Returns {data, proposed_cursor, state} — the cursor is only a PROPOSAL
+  # here; tick/1 commits it after the detector phase (F1: a tick where a
+  # feed-consuming detector failed must re-read this window next tick).
   defp fetch(swarm, entry, state) do
-    token = resolve_token(entry)
-    base = entry["dashboard_url"]
+    cursor = Map.get(state.feed_cursors, swarm)
 
-    {feed, state} =
-      case Map.fetch(state.feed_cursors, swarm) do
-        :error -> drain_feed(swarm, base, token, state, 0, [], @feed_first_read_max_pages)
-        {:ok, since} -> read_feed_page(swarm, base, since, token, state)
-      end
+    {data, proposed} =
+      Ingest.fetch(state.client, state.client_opts, swarm, entry, cursor, @feed_max_pages)
 
-    data = %{
-      dashboard: safe_client(state, :get_dashboard, [base, swarm, token, state.client_opts]),
-      events: safe_client(state, :get_events, [base, swarm, token, state.client_opts]),
-      feed: feed
-    }
-
-    {data, state}
+    {data, proposed, state}
   end
-
-  # Steady state: one page per tick, cursor advances to the returned seq.
-  defp read_feed_page(swarm, base, since, token, state) do
-    case safe_client(state, :get_events_feed, [base, swarm, since, token, state.client_opts]) do
-      {:ok, %{events: events, seq: seq}} when is_list(events) and is_integer(seq) and seq >= 0 ->
-        {{:ok, events}, put_feed_cursor(state, swarm, seq)}
-
-      :unavailable ->
-        {:unavailable, state}
-
-      {:error, reason} ->
-        {{:error, reason}, state}
-
-      other ->
-        {{:error, {:bad_feed_return, other}}, state}
-    end
-  end
-
-  # First-read drain: loop pages, advancing `since` to each returned seq,
-  # until an empty page (head reached), a non-advancing page (an echo or a
-  # mid-drain feed restart — stop WITHOUT appending it, or the same events
-  # would union twice), or the page budget. Any mid-drain failure discards
-  # the partial union and reports the error with the cursor untouched —
-  # feeding a partial drain to the detectors would recreate the exact
-  # page-boundary false-alert this drain exists to prevent, and nothing is
-  # lost: the unset cursor re-drains from 0 next tick.
-  defp drain_feed(swarm, base, token, state, since, acc, pages_left) do
-    case safe_client(state, :get_events_feed, [base, swarm, since, token, state.client_opts]) do
-      {:ok, %{events: events, seq: seq}} when is_list(events) and is_integer(seq) and seq >= 0 ->
-        cond do
-          events == [] or seq <= since ->
-            {{:ok, acc}, put_feed_cursor(state, swarm, seq)}
-
-          pages_left <= 1 ->
-            {{:ok, acc ++ events}, put_feed_cursor(state, swarm, seq)}
-
-          true ->
-            drain_feed(swarm, base, token, state, seq, acc ++ events, pages_left - 1)
-        end
-
-      :unavailable ->
-        {:unavailable, state}
-
-      {:error, reason} ->
-        {{:error, reason}, state}
-
-      other ->
-        {{:error, {:bad_feed_return, other}}, state}
-    end
-  end
-
-  defp put_feed_cursor(state, swarm, seq),
-    do: %{state | feed_cursors: Map.put(state.feed_cursors, swarm, seq)}
 
   # A crashing client must read as endpoint_down, never take the object down.
   defp safe_client(state, fun, args) do
@@ -650,19 +580,6 @@ defmodule Genswarms.Observer.Objects.Scope do
     e -> {:error, {:client_crash, Exception.message(e)}}
   catch
     :exit, reason -> {:error, {:client_exit, reason}}
-  end
-
-  defp resolve_token(entry) do
-    case entry["token_env"] do
-      env when is_binary(env) and env != "" ->
-        case System.get_env(env) do
-          t when is_binary(t) and t != "" -> t
-          _ -> nil
-        end
-
-      _ ->
-        nil
-    end
   end
 
   # ── alerting: dedupe + cooldown, then card to :sender ─────────────────────
@@ -1020,7 +937,7 @@ defmodule Genswarms.Observer.Objects.Scope do
         {:reply, Jason.encode!(%{ok: false, error: "swarm #{swarm} is not observed"}), state}
 
       entry ->
-        token = resolve_token(entry)
+        token = Ingest.resolve_token(entry)
         fun = if kind == :dashboard, do: :get_dashboard, else: :get_events
 
         case safe_client(state, fun, [entry["dashboard_url"], to_string(swarm), token, state.client_opts]) do
@@ -1104,7 +1021,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   # prompt's warning is the mitigation) but is NEVER written into
   # `relay_log`, which carries call metadata only.
   defp allow_relay(state, now, from, swarm, cid, entry, key) do
-    token = resolve_token(entry)
+    token = Ingest.resolve_token(entry)
 
     reply =
       case safe_client(state, :get_session_history, [
