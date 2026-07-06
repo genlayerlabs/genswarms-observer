@@ -471,8 +471,10 @@ defmodule Genswarms.Observer.Objects.Scope do
   # ── digest (O4): conversation_topics extension → cards, seen-after-send ────
   #
   # Runs AFTER the detector/alert phase for this swarm, over the SAME fetch
-  # (`data`) already pulled this tick — no extra round-trip. `Digest.plan/2`
-  # is pure and total: a missing/malformed extension yields `{[], []}` and
+  # (`data`) already pulled this tick — no extra round-trip. `Digest.plan/3`
+  # is passed `swarm`, the trusted registry key, so a compromised or buggy
+  # upstream can never spoof a card title via `envelope["swarm"]`. It is
+  # pure and total: a missing/malformed extension yields `{[], []}` and
   # this is a no-op. Cards are sent one by one; `seen_periods` is only
   # merged (and the tick only marked dirty) when EVERY card for this swarm
   # delivered `:ok` this tick — a partial failure retries the whole batch
@@ -480,7 +482,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   # content, so re-sending an already-delivered one on retry is harmless.
   defp deliver_digest(state, swarm, %{dashboard: {:ok, envelope}}) do
     seen = Map.get(state.seen_periods, swarm, MapSet.new())
-    {cards, newly_seen} = Digest.plan(envelope, seen)
+    {cards, newly_seen} = Digest.plan(swarm, envelope, seen)
 
     case send_cards(state, cards) do
       :ok when newly_seen != [] ->

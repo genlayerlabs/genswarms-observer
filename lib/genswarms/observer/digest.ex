@@ -2,10 +2,11 @@ defmodule Genswarms.Observer.Digest do
   @moduledoc """
   Pure planner for the `conversation_topics` dashboard extension digest.
 
-  `plan/2` takes a fetched dashboard envelope and the set of period ids
-  already delivered for that swarm, and decides what (if anything) to send
-  this tick. It is total and side-effect free: no HTTP, no clock, no store
-  access, no crashing — any unexpected shape simply yields no cards and no
+  `plan/3` takes the TRUSTED swarm name (the caller's registry key), a
+  fetched dashboard envelope, and the set of period ids already delivered
+  for that swarm, and decides what (if anything) to send this tick. It is
+  total and side-effect free: no HTTP, no clock, no store access, no
+  crashing — any unexpected shape simply yields no cards and no
   newly-seen ids. `Genswarms.Observer.Objects.Scope` owns delivery and the
   seen-after-send invariant (marking a period seen only once its card has
   actually been delivered).
@@ -89,22 +90,33 @@ defmodule Genswarms.Observer.Digest do
   ]
 
   @doc """
-  Pure. `envelope` is the dashboard payload for one swarm; `seen` is the
-  `MapSet` of period ids already delivered for that swarm. Returns
-  `{cards, newly_seen}` — `cards` is what to send this tick (already in
-  the same `%{"title" => ..., "blocks" => [%{"kind" => "paragraph", "text"
-  => ...}]}` shape `emit_alert/3` uses), `newly_seen` is the list of
-  period ids to fold into the store ONLY after every card for this swarm
-  has delivered successfully.
+  Pure. `swarm` is the TRUSTED swarm name — the registry key the caller
+  (`Genswarms.Observer.Objects.Scope`) already has, operator-config, never
+  derived from the envelope. `envelope` is the dashboard payload for that
+  swarm; `seen` is the `MapSet` of period ids already delivered for it.
+  Returns `{cards, newly_seen}` — `cards` is what to send this tick
+  (already in the same `%{"title" => ..., "blocks" => [%{"kind" =>
+  "paragraph", "text" => ...}]}` shape `emit_alert/3` uses), `newly_seen`
+  is the list of period ids to fold into the store ONLY after every card
+  for this swarm has delivered successfully.
+
+  `envelope["swarm"]` is untrusted (it's fetched from the observed
+  swarm's own dashboard) and is NEVER used for the card title — only
+  `swarm` is. If `swarm` itself is missing/non-binary (defensive only;
+  callers must always pass the registry key), falls back to the
+  untrusted `envelope["swarm"]` field, sanitized. Card titles are always
+  passed through `sanitize_label/1` before rendering, since the trusted
+  arg is operator-config today but titles may carry user-ish chars down
+  the line.
 
   Total: any malformed/absent extension, wrong `v`, or garbage argument
   (including a non-map `envelope` or a `seen` that isn't a `MapSet`)
   yields `{[], []}` rather than raising.
   """
-  @spec plan(map, MapSet.t()) :: {[map], [String.t()]}
-  def plan(envelope, seen) when is_map(envelope) do
+  @spec plan(String.t(), map, MapSet.t()) :: {[map], [String.t()]}
+  def plan(swarm, envelope, seen) when is_map(envelope) do
     seen = normalize_seen(seen)
-    swarm = swarm_of(envelope)
+    swarm = trusted_swarm(swarm, envelope)
 
     case get_extension(envelope) do
       %{"v" => 1, "periods" => periods} = ext when is_list(periods) ->
@@ -124,7 +136,7 @@ defmodule Genswarms.Observer.Digest do
     end
   end
 
-  def plan(_envelope, _seen), do: {[], []}
+  def plan(_swarm, _envelope, _seen), do: {[], []}
 
   # ── extraction / validation ────────────────────────────────────────────────
 
@@ -135,9 +147,15 @@ defmodule Genswarms.Observer.Digest do
     end
   end
 
-  defp swarm_of(envelope) do
+  # `swarm` is the trusted registry key the caller passed. Only a
+  # non-binary/blank arg (defensive only — callers must always pass the
+  # registry key) falls back to the untrusted envelope field, and even
+  # then it's sanitized before ever reaching a card title.
+  defp trusted_swarm(swarm, _envelope) when is_binary(swarm) and swarm != "", do: swarm
+
+  defp trusted_swarm(_swarm, envelope) do
     case Map.get(envelope, "swarm") do
-      s when is_binary(s) and s != "" -> s
+      s when is_binary(s) and s != "" -> sanitize_label(s)
       _ -> "unknown"
     end
   end
@@ -171,7 +189,7 @@ defmodule Genswarms.Observer.Digest do
   end
 
   defp full_card(swarm, coverage, period) do
-    title = "📊 digest: #{swarm} · #{period["period_id"]}"
+    title = "📊 digest: #{escape_markdown(swarm)} · #{period["period_id"]}"
 
     blocks =
       if period["status"] == "error_redacted" do
@@ -200,7 +218,7 @@ defmodule Genswarms.Observer.Digest do
         "dm" -> "coverage: dm — DM conversations only"
         "group" -> "coverage: group — group conversations only"
         "all" -> "coverage: all — DM and group conversations"
-        other when is_binary(other) -> "coverage: #{other}"
+        other when is_binary(other) -> "coverage: #{sanitize_label(other)}"
         _ -> "coverage: unknown"
       end
 
@@ -266,7 +284,7 @@ defmodule Genswarms.Observer.Digest do
     total_turns = sum_counts(older, "turns")
 
     %{
-      "title" => "📊 digest: #{swarm} · missed #{n} periods",
+      "title" => "📊 digest: #{escape_markdown(swarm)} · missed #{n} periods",
       "blocks" => [
         %{"kind" => "paragraph", "text" => range_text},
         %{

@@ -31,17 +31,22 @@ defmodule Genswarms.Observer.DigestTest do
 
   defp texts(card), do: Enum.map(card["blocks"], & &1["text"])
 
+  # plan/3 takes the trusted swarm name explicitly — tests default it to
+  # "wingston" to match envelope/2's default "swarm" field, except where a
+  # test deliberately mismatches them to prove the envelope field is inert.
+  defp plan(envelope, seen, swarm \\ "wingston"), do: Digest.plan(swarm, envelope, seen)
+
   # ── shape / version gates ────────────────────────────────────────────────
 
   test "unknown v is ignored entirely" do
-    assert Digest.plan(envelope([period("2026-07-01")], v: 2), MapSet.new()) == {[], []}
-    assert Digest.plan(envelope([period("2026-07-01")], v: "1"), MapSet.new()) == {[], []}
-    assert Digest.plan(envelope([period("2026-07-01")], v: nil), MapSet.new()) == {[], []}
+    assert plan(envelope([period("2026-07-01")], v: 2), MapSet.new()) == {[], []}
+    assert plan(envelope([period("2026-07-01")], v: "1"), MapSet.new()) == {[], []}
+    assert plan(envelope([period("2026-07-01")], v: nil), MapSet.new()) == {[], []}
   end
 
   test "missing extension yields no cards" do
-    assert Digest.plan(%{"swarm" => "wingston"}, MapSet.new()) == {[], []}
-    assert Digest.plan(%{"swarm" => "wingston", "extensions" => %{}}, MapSet.new()) == {[], []}
+    assert plan(%{"swarm" => "wingston"}, MapSet.new()) == {[], []}
+    assert plan(%{"swarm" => "wingston", "extensions" => %{}}, MapSet.new()) == {[], []}
   end
 
   test "periods not a list yields no cards" do
@@ -52,12 +57,12 @@ defmodule Genswarms.Observer.DigestTest do
       }
     }
 
-    assert Digest.plan(env, MapSet.new()) == {[], []}
+    assert plan(env, MapSet.new()) == {[], []}
   end
 
   test "non-final periods never render and never enter newly_seen" do
     env = envelope([period("2026-07-01", final: false), period("2026-07-02", final: false)])
-    assert Digest.plan(env, MapSet.new()) == {[], []}
+    assert plan(env, MapSet.new()) == {[], []}
   end
 
   test "garbage top-level input never crashes" do
@@ -80,9 +85,36 @@ defmodule Genswarms.Observer.DigestTest do
     ]
 
     for env <- garbage do
-      assert Digest.plan(env, MapSet.new()) == {[], []}
-      assert Digest.plan(env, :not_a_mapset) == {[], []}
+      assert plan(env, MapSet.new()) == {[], []}
+      assert plan(env, :not_a_mapset) == {[], []}
     end
+  end
+
+  # ── trusted swarm name (untrusted envelope["swarm"] must not leak in) ────
+
+  test "card title uses the trusted swarm arg, never the untrusted envelope field" do
+    evil_swarm = "evil" <> <<0x202E::utf8>> <> "name*[link](x)"
+    env = envelope([period("2026-07-01")], swarm: evil_swarm)
+    {[full], _} = Digest.plan("wingston", env, MapSet.new())
+
+    assert full["title"] =~ "digest: wingston · 2026-07-01"
+    refute full["title"] =~ "evil"
+    refute full["title"] =~ <<0x202E::utf8>>
+  end
+
+  test "coalesced card title also uses the trusted swarm arg" do
+    evil_swarm = "evil" <> <<0x202E::utf8>> <> "name*[link](x)"
+
+    env =
+      envelope(
+        [period("2026-07-01"), period("2026-07-02")],
+        swarm: evil_swarm
+      )
+
+    {[_full, coalesced], _newly_seen} = Digest.plan("wingston", env, MapSet.new())
+
+    assert coalesced["title"] =~ "digest: wingston · missed 1 periods"
+    refute coalesced["title"] =~ "evil"
   end
 
   # ── selection: ascending, newest-full + coalesce ─────────────────────────
@@ -96,21 +128,21 @@ defmodule Genswarms.Observer.DigestTest do
         period("2026-07-02")
       ])
 
-    {[full, _coalesced], newly_seen} = Digest.plan(env, MapSet.new())
+    {[full, _coalesced], newly_seen} = plan(env, MapSet.new())
     assert full["title"] =~ "2026-07-03"
     assert Enum.sort(newly_seen) == ["2026-07-01", "2026-07-02", "2026-07-03"]
   end
 
   test "single unseen final period yields exactly one full card" do
     env = envelope([period("2026-07-01")])
-    {cards, newly_seen} = Digest.plan(env, MapSet.new())
+    {cards, newly_seen} = plan(env, MapSet.new())
     assert length(cards) == 1
     assert newly_seen == ["2026-07-01"]
   end
 
   test "two unseen final periods: newest full + one coalesced card for the rest" do
     env = envelope([period("2026-07-01"), period("2026-07-02")])
-    {cards, newly_seen} = Digest.plan(env, MapSet.new())
+    {cards, newly_seen} = plan(env, MapSet.new())
 
     assert length(cards) == 2
     [full, coalesced] = cards
@@ -123,7 +155,7 @@ defmodule Genswarms.Observer.DigestTest do
     periods = for d <- 1..9, do: period("2026-07-0#{d}")
     env = envelope(periods)
 
-    {cards, newly_seen} = Digest.plan(env, MapSet.new())
+    {cards, newly_seen} = plan(env, MapSet.new())
     assert length(cards) == 2
 
     [full, coalesced] = cards
@@ -136,7 +168,7 @@ defmodule Genswarms.Observer.DigestTest do
     env = envelope([period("2026-07-01"), period("2026-07-02"), period("2026-07-03")])
     seen = MapSet.new(["2026-07-01"])
 
-    {cards, newly_seen} = Digest.plan(env, seen)
+    {cards, newly_seen} = plan(env, seen)
     assert length(cards) == 2
     assert Enum.sort(newly_seen) == ["2026-07-02", "2026-07-03"]
   end
@@ -144,7 +176,7 @@ defmodule Genswarms.Observer.DigestTest do
   test "all periods already seen yields no cards" do
     env = envelope([period("2026-07-01"), period("2026-07-02")])
     seen = MapSet.new(["2026-07-01", "2026-07-02"])
-    assert Digest.plan(env, seen) == {[], []}
+    assert plan(env, seen) == {[], []}
   end
 
   test "coalesced card sums counts across the older periods" do
@@ -155,7 +187,7 @@ defmodule Genswarms.Observer.DigestTest do
         period("2026-07-03", counts: %{"conversations" => 1, "turns" => 1})
       ])
 
-    {[_full, coalesced], _newly_seen} = Digest.plan(env, MapSet.new())
+    {[_full, coalesced], _newly_seen} = plan(env, MapSet.new())
     assert texts(coalesced) |> Enum.any?(&(&1 =~ "conversations 8, turns 11"))
     assert texts(coalesced) |> Enum.any?(&(&1 =~ "period range: 2026-07-01 to 2026-07-02"))
   end
@@ -164,7 +196,7 @@ defmodule Genswarms.Observer.DigestTest do
 
   test "error_redacted status renders a single unavailable-summary block" do
     env = envelope([period("2026-07-01", status: "error_redacted")])
-    {[full], _} = Digest.plan(env, MapSet.new())
+    {[full], _} = plan(env, MapSet.new())
 
     assert [%{"kind" => "paragraph", "text" => text}] = full["blocks"]
     assert text =~ "summary unavailable for this period"
@@ -180,15 +212,28 @@ defmodule Genswarms.Observer.DigestTest do
           {"all", "coverage: all — DM and group conversations"}
         ] do
       env = envelope([period("2026-07-01")], coverage: coverage)
-      {[full], _} = Digest.plan(env, MapSet.new())
+      {[full], _} = plan(env, MapSet.new())
       assert texts(full) |> Enum.any?(&(&1 == expect))
     end
   end
 
   test "unknown coverage falls back without crashing" do
     env = envelope([period("2026-07-01")], coverage: nil)
-    {[full], _} = Digest.plan(env, MapSet.new())
+    {[full], _} = plan(env, MapSet.new())
     assert texts(full) |> Enum.any?(&(&1 == "coverage: unknown"))
+  end
+
+  test "an untrusted string coverage value is sanitized before rendering" do
+    nasty = "x" <> <<0x202E::utf8>> <> "y*_[inj]"
+    env = envelope([period("2026-07-01")], coverage: nasty)
+    {[full], _} = plan(env, MapSet.new())
+
+    line = texts(full) |> Enum.find(&String.starts_with?(&1, "coverage:"))
+    refute line =~ <<0x202E::utf8>>
+    assert line =~ "\\*"
+    assert line =~ "\\_"
+    assert line =~ "\\["
+    assert line =~ "\\]"
   end
 
   # ── topics / signals rendering ───────────────────────────────────────────
@@ -204,7 +249,7 @@ defmodule Genswarms.Observer.DigestTest do
         )
       ])
 
-    {[full], _} = Digest.plan(env, MapSet.new())
+    {[full], _} = plan(env, MapSet.new())
     topics_text = texts(full) |> Enum.find(&(&1 =~ "billing"))
     assert topics_text =~ "• billing questions (4)"
     assert topics_text =~ "• onboarding (2)"
@@ -212,11 +257,11 @@ defmodule Genswarms.Observer.DigestTest do
 
   test "signals render when present, omitted when absent" do
     env = envelope([period("2026-07-01", signals: [%{"kind" => "frustration", "count" => 3}])])
-    {[full], _} = Digest.plan(env, MapSet.new())
+    {[full], _} = plan(env, MapSet.new())
     assert texts(full) |> Enum.any?(&(&1 == "signals: frustration (3)"))
 
     env2 = envelope([period("2026-07-02", signals: [])])
-    {[full2], _} = Digest.plan(env2, MapSet.new())
+    {[full2], _} = plan(env2, MapSet.new())
     refute texts(full2) |> Enum.any?(&String.starts_with?(&1, "signals:"))
   end
 
@@ -224,7 +269,7 @@ defmodule Genswarms.Observer.DigestTest do
     env =
       envelope([period("2026-07-01", topics: [%{"label" => "6001112223334445", "count" => 9}])])
 
-    {[full], _} = Digest.plan(env, MapSet.new())
+    {[full], _} = plan(env, MapSet.new())
     refute texts(full) |> Enum.any?(&(&1 =~ "•"))
   end
 
@@ -237,7 +282,7 @@ defmodule Genswarms.Observer.DigestTest do
         )
       ])
 
-    {[full], _} = Digest.plan(env, MapSet.new())
+    {[full], _} = plan(env, MapSet.new())
     assert texts(full) |> Enum.any?(&(&1 =~ "• ok one (1)"))
     assert texts(full) |> Enum.any?(&(&1 == "signals: confusion (1)"))
   end
