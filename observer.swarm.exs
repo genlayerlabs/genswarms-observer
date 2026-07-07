@@ -33,6 +33,15 @@ registry =
   end
 
 tick_cron = System.get_env("OBSERVER_TICK_CRON") || "*/5 * * * *"
+
+# Operator-authored health rules (fail-CLOSED at boot — see Scope's
+# `signal_rules` config). Same JSON-env pattern as OBSERVER_REGISTRY_JSON:
+# a list of rule maps, each carrying its target "block" key.
+signal_rules =
+  case System.get_env("OBSERVER_SIGNAL_RULES_JSON") do
+    json when is_binary(json) and json != "" -> Jason.decode!(json)
+    _ -> []
+  end
 smoke? = System.get_env("OBSERVER_SMOKE") == "1"
 
 if (System.get_env("OBSERVER_TELEGRAM_BOT_TOKEN") || "") == "" do
@@ -141,7 +150,8 @@ diagnostico =
             tick_sources: ["cron"],
             read_sources: ["diagnostico"],
             sender: :sender,
-            escalate_to: :diagnostico
+            escalate_to: :diagnostico,
+            signal_rules: signal_rules
           },
           Map.new(scope_client)
         )
