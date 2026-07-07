@@ -31,8 +31,9 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
   as an overlapping window across ticks — `request_open` only opens a cid
   the FIRST time it's seen (`Map.put_new/3`), so a re-delivered open in a
   later window neither resets the clock nor causes a second alert. An ok
-  reply clears the cid entirely (a later re-open starts fresh). Once alerted,
-  a still-open cid is not re-alerted while it remains open. The feed cursor
+  reply clears the cid entirely (a later re-open starts fresh). Once an
+  alert for a cid has actually EMITTED (post-budget — see on_emitted/2),
+  the still-open cid is not re-alerted while it remains open. The feed cursor
   itself is Scope's (session-local): after a restart the ring replays
   ascending from 0 and every answered open/reply pair cancels out here.
   """
@@ -67,6 +68,19 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
         {[], ctx.state}
     end
   end
+
+  @impl true
+  # F4: the alerted flag is the re-fire guard — it must reflect what the
+  # OPERATOR saw, not what detect/2 generated. Applied only for alerts that
+  # actually emitted.
+  def on_emitted(state, %{cids: [cid]}) when is_map(state) do
+    case state do
+      %{^cid => info} -> Map.put(state, cid, %{info | alerted: true})
+      _ -> state
+    end
+  end
+
+  def on_emitted(state, _alert), do: state
 
   # The EventsSource contract guarantees oldest-first ascending (wingston
   # vendor/genswarms-dashboard/backend README §EventsSource: "Events with
@@ -138,7 +152,7 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
 
           is_integer(info.opened_ms) and now_ms - info.opened_ms > window_ms ->
             {[unanswered_alert(swarm, now_ms, cid, info.opened_ms) | alerts],
-             Map.put(acc, cid, %{info | alerted: true})}
+             Map.put(acc, cid, info)}
 
           true ->
             {alerts, Map.put(acc, cid, info)}

@@ -1159,4 +1159,55 @@ defmodule Genswarms.Observer.ScopeTest do
       assert length(unanswered) == 1
     end
   end
+
+  describe "F4: budget-dropped alerts re-emit on later ticks" do
+    @tag regression: "F4"
+    test "9 overdue conversations all eventually alert individually" do
+      open_ts = @t0 / 1000 - 20 * 60
+
+      feed_events =
+        for i <- 1..9 do
+          %{"kind" => "request_open", "cid" => "tg:#{i}:0", "seq" => i, "ts" => open_ts + i / 10}
+        end
+
+      # `events_feed` as a 1-arity fun of `since` (real Fake vocabulary —
+      # there is no `Client.Fake.set_feed`): since == 0 drains the full
+      # backlog in tick 1 (Ingest pages to head), and since >= 9 (the
+      # committed cursor after tick 1) answers with an empty page at the
+      # same seq — exactly tick-1-full / tick-2-empty.
+      feed_fun = fn
+        0 -> {:ok, %{events: feed_events, seq: 9}}
+        _ -> {:ok, %{events: [], seq: 9}}
+      end
+
+      %{state: state, clock: clock, outbox: outbox} =
+        start_scope(
+          fixture: %{"wingston" => Map.put(healthy_fixture(), :events_feed, feed_fun)}
+        )
+
+      # Tick 1: 6 individual cards + 1 coalesced summary.
+      {_, state} = decode_reply(tick(state))
+
+      # Tick 2 (feed empty now — the opens were consumed): the 3 dropped
+      # cids are still unmarked and re-fire within the budget.
+      advance(clock, 60_000)
+      {_, _state} = decode_reply(tick(state))
+
+      # Anchored on the alert's own "request <cid> unanswered for" summary
+      # phrase, not a bare `tg:\d+:0` scan over the whole card JSON — the
+      # latter also matches the fixture's routing `alert_conversation_id`
+      # ("tg:42:0", embedded in every card's `conversation_id` field),
+      # which would inflate the unique count by one phantom "cid".
+      unanswered_cids =
+        sent(outbox)
+        |> Enum.filter(&String.contains?(&1.content, "unanswered for"))
+        |> Enum.flat_map(fn %{content: c} ->
+          Regex.scan(~r/request (tg:\d+:0) unanswered for/, c, capture: :all_but_first)
+        end)
+        |> List.flatten()
+        |> Enum.uniq()
+
+      assert length(unanswered_cids) == 9
+    end
+  end
 end

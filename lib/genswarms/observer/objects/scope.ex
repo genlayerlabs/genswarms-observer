@@ -527,6 +527,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         st = %{st | last_alert: new_last_alert}
         st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry, now) end)
+        st = apply_on_emitted(st, swarm, budgeted)
 
         st = deliver_digest(st, swarm, data, now)
 
@@ -855,6 +856,33 @@ defmodule Genswarms.Observer.Objects.Scope do
       failing = for {stage, %{last_error: err}} <- stages, err != nil, do: stage
       {swarm, %{ok: failing == [], failing: Enum.sort(failing)}}
     end)
+  end
+
+  # F4: feed back emission into the owning detector's state, so re-fire
+  # guards reflect delivery, not generation. `source` is runner-stamped
+  # provenance — never detector-supplied — so this can't be misdirected.
+  defp apply_on_emitted(state, swarm, emitted) do
+    Enum.reduce(emitted, state, fn alert, st ->
+      mod = Map.get(alert, :source)
+
+      if is_atom(mod) and Code.ensure_loaded?(mod) and function_exported?(mod, :on_emitted, 2) do
+        update_in(st.det[swarm], fn
+          nil -> nil
+          per_swarm -> Map.update(per_swarm, mod, nil, &safe_on_emitted(mod, &1, alert))
+        end)
+      else
+        st
+      end
+    end)
+  end
+
+  # A raising on_emitted must not take the tick down — keep prior state.
+  defp safe_on_emitted(mod, det_state, alert) do
+    mod.on_emitted(det_state, alert)
+  rescue
+    _ -> det_state
+  catch
+    _, _ -> det_state
   end
 
   defp emit_alert(state, alert, entry, now) do

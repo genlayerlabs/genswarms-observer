@@ -58,5 +58,14 @@ defmodule Genswarms.Observer.Detector do
   @doc "Initial per-swarm state, before any tick has run for that swarm."
   @callback init() :: term
 
-  @optional_callbacks default_thresholds: 0, init: 0
+  @doc """
+  Optional. Called by the pipeline for each alert this module produced that
+  ACTUALLY EMITTED (survived cooldown, dedupe and the per-tick budget),
+  with the module's current per-swarm state. Detectors whose re-fire guard
+  lives in their own state apply it here — marking at generation time
+  loses budget-dropped alerts forever (F4).
+  """
+  @callback on_emitted(state :: term, alert :: alert) :: term
+
+  @optional_callbacks default_thresholds: 0, init: 0, on_emitted: 2
 end

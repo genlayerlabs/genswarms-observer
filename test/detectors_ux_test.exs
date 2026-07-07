@@ -159,7 +159,12 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       ctx0 = %{swarm: "w", thresholds: thresholds, state: nil, now_ms: 16 * 60_000}
       {alerts1, state1} = Unanswered.detect(f, ctx0)
       assert [%{type: :unanswered, cids: ["tg:1:0"]}] = alerts1
-      assert state1["tg:1:0"] == %{opened_ms: 0, alerted: true}
+      # F4: detect/2 no longer marks alerted — that's on_emitted/2's job,
+      # applied only once the alert actually emits (see the F4 describe
+      # block below). Simulate the emission here so this dedupe test still
+      # exercises the "already alerted" path on tick 2.
+      assert state1["tg:1:0"] == %{opened_ms: 0, alerted: false}
+      state1 = Unanswered.on_emitted(state1, hd(alerts1))
 
       # Next tick's fetch still returns the same request_open (feed window
       # overlap) and the cid is still open — must NOT re-alert.
@@ -414,6 +419,45 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       }
 
       assert {[], %{}} = Unanswered.detect(f, ctx0)
+    end
+  end
+
+  describe "Unanswered — F4: alerted flag applies on emit, not on generation" do
+    @tag regression: "F4"
+    test "detect/2 no longer sets alerted:true; on_emitted/2 does" do
+      open_ms = 1_000
+      events = [%{"kind" => "request_open", "cid" => "tg:5:0", "seq" => 1, "ts" => 1.0}]
+
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: open_ms + 16 * 60_000
+      }
+
+      {[alert], state} =
+        Genswarms.Observer.Detectors.Unanswered.detect(%{feed: {:ok, events}}, ctx)
+
+      assert alert.type == :unanswered
+      # Generation does NOT mark: if this alert is budget-dropped, the cid
+      # must stay eligible.
+      assert state["tg:5:0"].alerted == false
+
+      state = Genswarms.Observer.Detectors.Unanswered.on_emitted(state, alert)
+      assert state["tg:5:0"].alerted == true
+    end
+
+    @tag regression: "F4"
+    test "an unmarked overdue cid re-alerts on the next detect" do
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: %{"tg:5:0" => %{opened_ms: 1_000, alerted: false}},
+        now_ms: 1_000 + 20 * 60_000
+      }
+
+      assert {[%{type: :unanswered}], _} =
+               Genswarms.Observer.Detectors.Unanswered.detect(%{feed: {:ok, []}}, ctx)
     end
   end
 
