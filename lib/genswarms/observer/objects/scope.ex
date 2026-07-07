@@ -4,6 +4,15 @@ defmodule Genswarms.Observer.Objects.Scope do
   per-tick fetch, and the alert pipeline. ObjectHandler by convention (no
   engine compile dep — the engine is reached via guarded apply).
 
+  Tick pipeline (per swarm, commit-together semantics):
+    Ingest.fetch      → data + a PROPOSED feed cursor (never committed there)
+    DetectorRunner.run → alerts + per-module states (commit-on-success)
+    quarantine        → 3 consecutive failures disable a module + drop its state
+    cursor commit     → ONLY if every active detector succeeded this tick
+    Lifecycle.process → cooldown, dedupe, budget, last_alert stamp + evict
+    on_emitted        → re-fire guards applied ONLY to alerts that emitted
+    Outbox            → cards / escalation / digest delivery at the edge
+
   Trust model (the ecosystem's non-negotiables):
   - Only THIS object does HTTP; agents ask it via the topology, never sockets.
   - Tokens enter as env-var NAMES (`token_env`, x-secret contract §14.2.1)
@@ -25,8 +34,10 @@ defmodule Genswarms.Observer.Objects.Scope do
     (two modules declaring the same key); an undeclared-but-referenced
     threshold key can't be known statically and is NOT checked here.
   - Dedupe + cooldown per alert `key` (default `{swarm, type}`, wingston
-    roster pattern) lives here: a persisting condition alerts once per
-    cooldown window, not once per tick. A per-swarm-per-tick alert budget
+    roster pattern): a persisting condition alerts once per cooldown window,
+    not once per tick. This POLICY lives in `Genswarms.Observer.Lifecycle`
+    (pure, called from `tick/1`); `Scope` threads the state through and
+    executes the resulting deliveries. A per-swarm-per-tick alert budget
     (default 6) caps how many cards one tick can emit for one swarm;
     overflow collapses into a single `:alerts_coalesced` summary alert.
   - Durability is injectable (`Genswarms.Observer.Store`, config key

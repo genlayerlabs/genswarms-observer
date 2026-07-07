@@ -1146,8 +1146,11 @@ defmodule Genswarms.Observer.ScopeTest do
       {_, state} = decode_reply(tick(state))
       assert state.feed_cursors == %{}
 
-      # Tick 2: detector healthy now; the SAME window replays, Unanswered
-      # sees the overdue open and fires — the request was not lost.
+      # Tick 2: detector healthy now; the SAME window replays. Tick 1
+      # already fired the Unanswered alert — what this tick proves is that
+      # the cursor finally commits once the detector runs clean, and the
+      # replayed window is processed idempotently (no duplicate alert;
+      # count stays 1 below).
       advance(clock, 60_000)
       {_, state} = decode_reply(tick(state))
 

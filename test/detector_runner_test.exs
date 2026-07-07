@@ -1,5 +1,6 @@
 defmodule DetectorRunnerTest do
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
   alias Genswarms.Observer.DetectorRunner
 
   defmodule Good do
@@ -151,17 +152,22 @@ defmodule DetectorRunnerTest do
 
     @tag regression: "F6"
     test "a non-numeric override falls back to the module default" do
-      {[alert], _, _} =
-        Genswarms.Observer.DetectorRunner.run(
-          [TypedThresholdDetector],
-          %{},
-          "w",
-          %{"typed.count" => "lots"},
-          %{},
-          1_000
-        )
+      {result, log} =
+        with_log(fn ->
+          Genswarms.Observer.DetectorRunner.run(
+            [TypedThresholdDetector],
+            %{},
+            "w",
+            %{"typed.count" => "lots"},
+            %{},
+            1_000
+          )
+        end)
+
+      {[alert], _, _} = result
 
       assert alert.evidence["count"] == 3
+      assert log =~ "does not match the default's type"
     end
 
     @tag regression: "F6"
