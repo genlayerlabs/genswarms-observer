@@ -21,4 +21,20 @@ defmodule Genswarms.Observer.OutboxTest do
     deliver = fn _, _, _ -> {:error, :down} end
     assert {:error, :down} = Outbox.send_card(deliver, :sender, :scope, "tg:42:0", %{})
   end
+
+  test "alert_card's dashboard link uses the entry's remote name; title and MCP hints keep the registry key" do
+    alert = %{swarm: "wingston-prod", type: :endpoint_down, summary: "s", evidence: %{}}
+    entry = %{"dashboard_url" => "http://remote.example", "repo" => nil, "name" => "wingston"}
+
+    card = Outbox.alert_card(alert, entry)
+
+    # The link must resolve on the remote host (which knows the swarm as
+    # "wingston"); the human-facing identity stays the registry key.
+    assert card["title"] =~ "wingston-prod"
+    assert Enum.any?(card["blocks"], fn b ->
+             b["text"] =~ "http://remote.example/api/swarms/wingston/dashboard"
+           end)
+
+    refute Enum.any?(card["blocks"], fn b -> b["text"] =~ "/api/swarms/wingston-prod/" end)
+  end
 end

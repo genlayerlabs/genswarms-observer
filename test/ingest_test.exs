@@ -57,6 +57,23 @@ defmodule Genswarms.Observer.IngestTest do
     assert proposed == 12
   end
 
+  test ~s(entry "name" overrides the swarm name on the remote wire — the registry key stays the local identity) do
+    # Two deployments of the same swarm (local + prod) need distinct registry
+    # keys, but both remotes serve /api/swarms/wingston/…. Client.Fake keys
+    # fixtures by the name the real client puts in the URL path, so resolving
+    # the "wingston" fixture under key "wingston-prod" proves the wire saw the
+    # entry's name — without it, every call answers {:error, :not_configured}.
+    fake = fake_with(fn 0 -> {:ok, %{events: [], seq: 0}} end)
+
+    entry = Map.put(@entry, "name", "wingston")
+
+    {data, _proposed} = Ingest.fetch(Client.Fake, [fake: fake], "wingston-prod", entry, nil, 10)
+
+    assert {:ok, %{"swarm" => "wingston"}} = data.dashboard
+    assert {:ok, []} = data.events
+    assert {:ok, []} = data.feed
+  end
+
   test "feed error leaves the proposal nil and reports the error" do
     fake = fake_with({:error, :boom})
 

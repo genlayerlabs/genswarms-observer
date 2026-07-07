@@ -1242,7 +1242,9 @@ defmodule Genswarms.Observer.Objects.Scope do
         token = Ingest.resolve_token(entry)
         fun = if kind == :dashboard, do: :get_dashboard, else: :get_events
 
-        case safe_client(state, fun, [entry["dashboard_url"], to_string(swarm), token, state.client_opts]) do
+        remote = Ingest.remote_name(entry, swarm)
+
+        case safe_client(state, fun, [entry["dashboard_url"], remote, token, state.client_opts]) do
           {:ok, result} when kind == :dashboard ->
             {:reply, Jason.encode!(%{ok: true, dashboard: result}), state}
 
@@ -1328,7 +1330,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     {reply, spent} =
       case safe_client(state, :get_session_history, [
              entry["dashboard_url"],
-             swarm,
+             Ingest.remote_name(entry, swarm),
              cid,
              token,
              state.client_opts
@@ -1421,11 +1423,13 @@ defmodule Genswarms.Observer.Objects.Scope do
     %{
       "dashboard_url" => entry_get(entry, :dashboard_url),
       "token_env" => entry_get(entry, :token_env),
-      "repo" => entry_get(entry, :repo)
+      "repo" => entry_get(entry, :repo),
+      "name" => entry_get(entry, :name)
     }
   end
 
-  defp normalize_entry(_), do: %{"dashboard_url" => nil, "token_env" => nil, "repo" => nil}
+  defp normalize_entry(_),
+    do: %{"dashboard_url" => nil, "token_env" => nil, "repo" => nil, "name" => nil}
 
   defp entry_get(entry, key),
     do: Map.get(entry, key, Map.get(entry, to_string(key)))

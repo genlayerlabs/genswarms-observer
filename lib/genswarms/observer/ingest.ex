@@ -26,16 +26,33 @@ defmodule Genswarms.Observer.Ingest do
   def fetch(client, client_opts, swarm, entry, cursor, max_pages) do
     token = resolve_token(entry)
     base = entry["dashboard_url"]
+    remote = remote_name(entry, swarm)
 
-    {feed, proposed} = drain_feed(client, client_opts, swarm, base, token, cursor || 0, [], max_pages)
+    {feed, proposed} = drain_feed(client, client_opts, remote, base, token, cursor || 0, [], max_pages)
 
     data = %{
-      dashboard: safe_call(client, :get_dashboard, [base, swarm, token, client_opts]),
-      events: safe_call(client, :get_events, [base, swarm, token, client_opts]),
+      dashboard: safe_call(client, :get_dashboard, [base, remote, token, client_opts]),
+      events: safe_call(client, :get_events, [base, remote, token, client_opts]),
       feed: feed
     }
 
     {data, proposed}
+  end
+
+  @doc """
+  The swarm name used in remote HTTP paths (`/api/swarms/<name>/...`).
+
+  The registry KEY is the observer-side identity (alerts, cursors, dedupe) and
+  must be unique per entry; the optional `"name"` field is what the remote
+  host calls the swarm. Two deployments of the same swarm (local + prod) can
+  then coexist under distinct keys while both fetch `/api/swarms/wingston/…`.
+  Defaults to the key, so existing registries are unaffected.
+  """
+  def remote_name(entry, key) do
+    case entry["name"] do
+      name when is_binary(name) and name != "" -> name
+      _ -> to_string(key)
+    end
   end
 
   defp drain_feed(client, opts, swarm, base, token, since, acc, pages_left) do

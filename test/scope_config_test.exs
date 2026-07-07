@@ -119,6 +119,23 @@ defmodule Genswarms.Observer.ScopeConfigTest do
     assert [%{module: ProbeDetector, swarms: ["wingston"]}] = state.custom_detectors
   end
 
+  test "registry entry :name (atom-keyed, the engine's config atomization) survives normalization" do
+    config =
+      base_config(%{
+        registry: %{
+          "wingston-prod" => %{
+            dashboard_url: "http://a.example",
+            token_env: nil,
+            repo: nil,
+            name: "wingston"
+          }
+        }
+      })
+
+    assert {:ok, state} = Scope.init(config)
+    assert state.registry["wingston-prod"]["name"] == "wingston"
+  end
+
   test "a bare module entry (no swarms map) is global" do
     config = base_config(%{custom_detectors: [ProbeDetector]})
 

@@ -31,7 +31,11 @@ defmodule Genswarms.Observer.Outbox do
   end
 
   def alert_card(alert, entry) do
-    dashboard_link = "#{entry["dashboard_url"]}/api/swarms/#{alert.swarm}/dashboard"
+    # The URL must resolve on the REMOTE host, so it uses the entry's remote
+    # name; the card title/investigate hints keep the registry key — that is
+    # the identity the fleet MCP addresses this swarm by.
+    remote = Genswarms.Observer.Ingest.remote_name(entry, alert.swarm)
+    dashboard_link = "#{entry["dashboard_url"]}/api/swarms/#{remote}/dashboard"
 
     repo_line =
       case entry["repo"] do
