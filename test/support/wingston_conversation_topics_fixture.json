@@ -1,0 +1,81 @@
+{
+  "conversation_topics": {
+    "coverage": "dm",
+    "periods": [
+      {
+        "counts": {
+          "conversations": 11,
+          "turns": 47
+        },
+        "final": true,
+        "generated_at": "2026-07-03T00:16:04Z",
+        "period_id": "2026-07-02",
+        "signals": [
+          {
+            "count": 3,
+            "kind": "frustration"
+          },
+          {
+            "count": 2,
+            "kind": "churn_risk"
+          }
+        ],
+        "source_watermark": 5231,
+        "status": "ok",
+        "topics": [
+          {
+            "count": 4,
+            "label": "rally onboarding confusion"
+          },
+          {
+            "count": 3,
+            "label": "claim rewards at"
+          },
+          {
+            "count": 2,
+            "label": "contact about payouts"
+          },
+          {
+            "count": 2,
+            "label": "call for support"
+          },
+          {
+            "count": 2,
+            "label": "verify at now"
+          },
+          {
+            "count": 3,
+            "label": "pricing *volume* [discounts]"
+          }
+        ]
+      },
+      {
+        "counts": {
+          "conversations": 0,
+          "turns": 0
+        },
+        "final": true,
+        "generated_at": "2026-07-04T00:15:31Z",
+        "period_id": "2026-07-03",
+        "signals": [],
+        "source_watermark": 5231,
+        "status": "ok",
+        "topics": []
+      },
+      {
+        "counts": {
+          "conversations": 6,
+          "turns": 19
+        },
+        "final": true,
+        "generated_at": "2026-07-05T00:17:12Z",
+        "period_id": "2026-07-04",
+        "signals": [],
+        "source_watermark": 5484,
+        "status": "error_redacted",
+        "topics": []
+      }
+    ],
+    "v": 1
+  }
+}

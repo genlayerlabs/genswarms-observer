@@ -22,7 +22,14 @@ defmodule Genswarms.Observer.Detectors do
   keeps the function pure. Start with `initial_state/0`.
 
   Dedupe/cooldown across ticks is NOT done here — that's Scope's job.
+
+  Also implements `Genswarms.Observer.Detector`, so it can run under
+  `DetectorRunner` alongside custom detectors — `detect/2` is a thin
+  adapter onto the `detect/5` shape above, which stays the primary/tested
+  entry point.
   """
+
+  @behaviour Genswarms.Observer.Detector
 
   @default_thresholds %{
     "stall_minutes" => 10,
@@ -31,9 +38,20 @@ defmodule Genswarms.Observer.Detectors do
     "pool_saturated_s" => 120
   }
 
+  @impl true
   def default_thresholds, do: @default_thresholds
 
   def initial_state, do: %{saturated_since_ms: nil}
+
+  @impl true
+  def init, do: initial_state()
+
+  @doc """
+  `Detector` callback adapter: delegates onto `detect/5` using the fields
+  carried in `ctx` (see `Genswarms.Observer.Detector.ctx/0`).
+  """
+  @impl true
+  def detect(fetched, ctx), do: detect(ctx.swarm, fetched, ctx.thresholds, ctx.state, ctx.now_ms)
 
   @doc """
   Runs every detector for one swarm. Returns `{alerts, det_state}`.

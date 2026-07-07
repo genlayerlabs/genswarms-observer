@@ -7,6 +7,16 @@ defmodule Genswarms.Observer.Client.Http do
 
   @behaviour Genswarms.Observer.Client
 
+  # Explicit feed page size. The dashboard route (vendored backend plug.ex,
+  # events/feed) defaults its "limit" param to 500 and warns "the host impl
+  # may clamp limit tighter" — one reference host clamps at 1_000. 500 pins
+  # the page size we already ride implicitly (same as the route default,
+  # under every known host clamp, so no wire behavior changes) instead of
+  # coupling it to someone else's constant; Scope's first-read drain sizes
+  # its 10-page budget against this value (10 × 500 = 5_000 ≥ the known
+  # host ring sizes, 4_096 and 5_000).
+  @feed_limit 500
+
   @impl true
   def get_dashboard(base_url, swarm, token, opts) do
     get_json("#{base_url}/api/swarms/#{swarm}/dashboard", token, opts)
@@ -19,6 +29,44 @@ defmodule Genswarms.Observer.Client.Http do
       {:ok, other} -> {:error, {:bad_events_envelope, other}}
       error -> error
     end
+  end
+
+  @impl true
+  def get_events_feed(base_url, swarm, since, token, opts) do
+    case get_json(feed_url(base_url, swarm, since), token, opts) do
+      {:ok, envelope} -> parse_feed_envelope(envelope)
+      error -> error
+    end
+  end
+
+  @doc """
+  Feed cursor-read URL, with the page size explicit (`limit=#{@feed_limit}`
+  — see the `@feed_limit` note). Public so the URL contract is testable
+  without an HTTP server.
+  """
+  def feed_url(base_url, swarm, since),
+    do: "#{base_url}/api/swarms/#{swarm}/events/feed?since=#{since}&limit=#{@feed_limit}"
+
+  @doc """
+  Maps the feed wire envelope (vendored dashboard backend,
+  genswarms_dashboard/plug.ex events/feed route) onto the client contract:
+
+      %{"events" => [...], "seq" => n, "source" => "feed"}        -> {:ok, %{events, seq}}
+      %{"events" => [],    "seq" => 0, "source" => "unavailable"} -> :unavailable
+
+  Public so the envelope mapping is testable without an HTTP server.
+  """
+  def parse_feed_envelope(%{"source" => "unavailable"}), do: :unavailable
+
+  def parse_feed_envelope(%{"events" => events, "seq" => seq})
+      when is_list(events) and is_integer(seq) and seq >= 0,
+      do: {:ok, %{events: events, seq: seq}}
+
+  def parse_feed_envelope(other), do: {:error, {:bad_feed_envelope, other}}
+
+  @impl true
+  def get_session_history(base_url, swarm, cid, token, opts) do
+    get_json("#{base_url}/api/swarms/#{swarm}/sessions/#{URI.encode_www_form(cid)}/history", token, opts)
   end
 
   defp get_json(url, token, opts) do
