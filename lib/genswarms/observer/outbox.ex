@@ -43,21 +43,91 @@ defmodule Genswarms.Observer.Outbox do
         _ -> ""
       end
 
-    %{
-      "title" => "⚠️ observer: #{alert.swarm} · #{alert.type}",
-      "blocks" => [
+    blocks =
+      [
         %{"kind" => "paragraph", "text" => alert.summary},
-        %{"kind" => "paragraph", "text" => "evidence: #{Jason.encode!(alert.evidence)}"},
+        explain_block(alert.type),
+        %{"kind" => "paragraph", "text" => evidence_lines(alert.evidence)},
         %{"kind" => "paragraph", "text" => "dashboard: #{dashboard_link}#{repo_line}"},
         %{
           "kind" => "paragraph",
           "text" =>
-            "investigate: connect the genswarms-fleet MCP and run " <>
-              ~s{get_events("#{alert.swarm}", level: "error") and get_dashboard("#{alert.swarm}").}
+            "investigate: fleet MCP → " <>
+              ~s{get_events("#{alert.swarm}", level: "error") · get_dashboard("#{alert.swarm}"). } <>
+              "(this bot only broadcasts — it cannot answer here)"
         }
       ]
-    }
+      |> Enum.reject(&is_nil/1)
+
+    %{"title" => "⚠️ observer: #{alert.swarm} · #{alert.type}", "blocks" => blocks}
   end
+
+  # ── card readability (operator feedback 2026-07-07) ─────────────────────────
+  # A raw {:failed_connect, ...} tuple twice over tells the operator nothing.
+  # Each built-in alert type carries one plain-language line: what it MEANS and
+  # the first move. The technical evidence stays — visible but last, as data.
+  defp explain_block(type) do
+    case explain(type) do
+      nil -> nil
+      text -> %{"kind" => "paragraph", "text" => "💡 " <> text}
+    end
+  end
+
+  defp explain(:endpoint_down),
+    do:
+      "The observer could not READ this swarm's dashboard — the swarm itself may be fine. " <>
+        "A deploy/restart (or a dropped VPN for a remote swarm) looks exactly like this and " <>
+        "clears on the next tick; persisting across 3+ ticks means the swarm or the network " <>
+        "path is really down."
+
+  defp explain(:unanswered),
+    do:
+      "A user's message has gone this long with NO reply: the agent stalled (LLM hang), the " <>
+        "reply was suppressed by the spam window, or the swarm restarted mid-turn. Restarts do " <>
+        "NOT recover queued turns — the user stays unanswered until they write again."
+
+  defp explain(:delivery_failure_burst),
+    do:
+      "Several outbound deliveries failed in a short window — Telegram is rejecting sends " <>
+        "(rate limit, blocked users, bad token) or the sender is down. Users are not seeing " <>
+        "the bot's messages."
+
+  defp explain(:health_rule),
+    do:
+      "A health rule crossed its threshold. The line above is the rule's own description — " <>
+        "it was written by the package (or operator) that published the rule, for exactly " <>
+        "this situation."
+
+  defp explain(:rules_gone),
+    do:
+      "This swarm STOPPED publishing health rules it previously had — usually a downgraded " <>
+        "deploy or a package regression. The observer is now blind to that block's health " <>
+        "until the rules come back."
+
+  defp explain(_type), do: nil
+
+  # evidence as readable `key: value` lines; long Erlang terms stay visible (the
+  # traceback matters) but truncated so the card never becomes a wall
+  @evidence_value_max 300
+  defp evidence_lines(evidence) when is_map(evidence) and map_size(evidence) > 0 do
+    lines =
+      evidence
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {k, v} -> "  #{k}: #{evidence_value(v)}" end)
+
+    Enum.join(["evidence:" | lines], "\n")
+  end
+
+  defp evidence_lines(evidence), do: "evidence: #{Jason.encode!(evidence)}"
+
+  defp evidence_value(v) when is_binary(v), do: truncate(v)
+  defp evidence_value(v) when is_number(v) or is_boolean(v) or is_atom(v), do: to_string(v)
+  defp evidence_value(v), do: truncate(Jason.encode!(v))
+
+  defp truncate(s) when byte_size(s) > @evidence_value_max,
+    do: String.slice(s, 0, @evidence_value_max) <> "…"
+
+  defp truncate(s), do: s
 
   # Fase 3: the same alert (already cooldown-deduped) escalates as a TASK to
   # the diagnosis agent. The agent has no network towards the swarms — the

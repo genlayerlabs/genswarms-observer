@@ -37,4 +37,29 @@ defmodule Genswarms.Observer.OutboxTest do
 
     refute Enum.any?(card["blocks"], fn b -> b["text"] =~ "/api/swarms/wingston-prod/" end)
   end
+  test "cards explain what the alert MEANS in plain language, evidence stays readable" do
+    alert = %{
+      swarm: "wingston",
+      type: :endpoint_down,
+      summary: "dashboard fetch failed: {:failed_connect, ...}",
+      evidence: %{"reason" => String.duplicate("x", 400)}
+    }
+
+    entry = %{"dashboard_url" => "http://a.example", "repo" => nil}
+    card = Outbox.alert_card(alert, entry)
+    texts = Enum.map(card["blocks"], & &1["text"])
+
+    assert Enum.any?(texts, &(&1 =~ "💡" and &1 =~ "deploy/restart"))
+    # the technical term stays visible but bounded — never a wall of Erlang
+    evidence = Enum.find(texts, &String.starts_with?(&1, "evidence:"))
+    assert evidence =~ "reason: xxx"
+    assert String.length(evidence) < 400
+    assert Enum.any?(texts, &(&1 =~ "cannot answer here"))
+  end
+
+  test "an unknown alert type carries no explainer block (no made-up guidance)" do
+    alert = %{swarm: "s", type: :something_custom, summary: "s", evidence: %{}}
+    card = Outbox.alert_card(alert, %{"dashboard_url" => "http://a", "repo" => nil})
+    refute Enum.any?(card["blocks"], &(&1["text"] =~ "💡"))
+  end
 end

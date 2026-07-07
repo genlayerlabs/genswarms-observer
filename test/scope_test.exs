@@ -169,7 +169,7 @@ defmodule Genswarms.Observer.ScopeTest do
 
     texts = Enum.map(msg["card"]["blocks"], & &1["text"])
     assert Enum.any?(texts, &(&1 =~ "http://dash.example:4994/api/swarms/wingston/dashboard"))
-    assert Enum.any?(texts, &(&1 =~ "genswarms-fleet"))
+    assert Enum.any?(texts, &(&1 =~ "fleet MCP"))
     assert Enum.any?(texts, &(&1 =~ "github.com/genlayerlabs/wingston-rally-bot"))
   end
 
