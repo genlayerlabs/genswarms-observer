@@ -856,7 +856,12 @@ defmodule Genswarms.Observer.Objects.Scope do
     Enum.reduce(emitted, state, fn alert, st ->
       mod = Map.get(alert, :source)
 
-      if is_atom(mod) and Code.ensure_loaded?(mod) and function_exported?(mod, :on_emitted, 2) do
+      # The runner stamps `source` on synthetic :detector_crashed /
+      # :detector_invalid alerts too (it's the module that FAILED, not one
+      # that emitted anything) — without this guard a module's on_emitted/2
+      # could be invoked with an alert it never produced.
+      if alert.type not in [:detector_crashed, :detector_invalid] and
+           is_atom(mod) and Code.ensure_loaded?(mod) and function_exported?(mod, :on_emitted, 2) do
         update_in(st.det[swarm], fn
           nil -> nil
           per_swarm -> Map.update(per_swarm, mod, nil, &safe_on_emitted(mod, &1, alert))
@@ -1066,7 +1071,13 @@ defmodule Genswarms.Observer.Objects.Scope do
            %{swarm: a.swarm, type: a.type, at_ms: a.at_ms, summary: a.summary}
          end),
        relay_log: state.relay_log,
-       health: state.health
+       health: state.health,
+       # Once quarantined, a module vanishes from det_health entirely (it no
+       # longer runs), so health alone reads "ok" and the trace would be
+       # lost — status must still surface it: a restart is the only lever
+       # that resets a quarantine streak.
+       quarantine:
+         Map.new(state.quarantine, fn {{s, m}, n} -> {"#{s}/#{inspect(m)}", n} end)
      }), state}
   end
 

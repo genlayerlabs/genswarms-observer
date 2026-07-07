@@ -5,9 +5,13 @@ defmodule Genswarms.Observer.Lifecycle do
   summary, itself cooldown-gated) → stamp emitted keys → evict dead keys.
 
   Pure: `%{emit:, suppressed:, last_alert:}` out, nothing else touched.
-  Only EMITTED keys are stamped into last_alert — a budget-dropped alert
-  stays eligible next tick (the F4 fix builds on this: its detector-side
-  `alerted` flag is also only applied on emit, via on_emitted/2).
+  `suppressed` counts EVERY dropped alert — cooldown-filtered, in-batch
+  same-key dedupe drops, and budget-dropped — so `emit + suppressed`
+  always equals the input count (plus the coalesced summary when it
+  emits). Only EMITTED keys are stamped into last_alert — a budget-dropped
+  alert stays eligible next tick (the F4 fix builds on this: its
+  detector-side `alerted` flag is also only applied on emit, via
+  on_emitted/2).
 
   F10: an entry older than the cooldown window can never suppress anything
   again (`cooled_down?` would return true regardless), so it is dead
@@ -27,7 +31,9 @@ defmodule Genswarms.Observer.Lifecycle do
           else: {passed, supp + 1}
       end)
 
-    deduped = passed |> Enum.reverse() |> Enum.uniq_by(&alert_key/1)
+    passed = Enum.reverse(passed)
+    deduped = Enum.uniq_by(passed, &alert_key/1)
+    deduped_dropped = length(passed) - length(deduped)
 
     {emit, coalesced_suppressed} =
       apply_budget(deduped, last_alert, cooldown_ms, budget, swarm, now_ms)
@@ -37,7 +43,11 @@ defmodule Genswarms.Observer.Lifecycle do
         Map.put(acc, alert_key(alert), alert.at_ms)
       end)
 
-    %{emit: emit, suppressed: cooled_suppressed + coalesced_suppressed, last_alert: stamped}
+    %{
+      emit: emit,
+      suppressed: cooled_suppressed + deduped_dropped + coalesced_suppressed,
+      last_alert: stamped
+    }
   end
 
   defp evict(last_alert, cooldown_ms, now_ms) do

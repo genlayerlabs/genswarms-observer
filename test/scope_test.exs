@@ -1098,6 +1098,29 @@ defmodule Genswarms.Observer.ScopeTest do
       assert crashed_after == crashed_before
       assert state.quarantine[{"wingston", AlwaysCrashDetector}] == 3
     end
+
+    @tag regression: "F2"
+    test "status carries the quarantine trace after a module is disabled" do
+      %{state: state, clock: clock} =
+        start_scope(config: %{custom_detectors: [AlwaysCrashDetector], cooldown_minutes: 0})
+
+      state =
+        Enum.reduce(1..3, state, fn _, st ->
+          advance(clock, 60_000)
+          {_, st} = decode_reply(tick(st))
+          st
+        end)
+
+      {:reply, json, _} = Scope.handle_message(:cron, ~s({"action":"status"}), state)
+      status = Jason.decode!(json)
+
+      # health goes quiet on a quarantined module (it's dropped from
+      # det_health entirely) — status must carry the trace instead, since
+      # a restart is the only reset lever.
+      assert status["quarantine"] == %{
+               "wingston/Genswarms.Observer.ScopeTest.AlwaysCrashDetector" => 3
+             }
+    end
   end
 
   # ── F1: cursor commit is gated on every active detector succeeding ────────
@@ -1211,6 +1234,63 @@ defmodule Genswarms.Observer.ScopeTest do
         |> Enum.uniq()
 
       assert length(unanswered_cids) == 9
+    end
+  end
+
+  # ── review fix: synthetic alerts never reach a detector's on_emitted/2 ────
+
+  defmodule SucceedsThenCrashesDetector do
+    @behaviour Genswarms.Observer.Detector
+    # Same named-Agent-flag pattern as CrashOnceDetector above, inverted:
+    # succeeds (and commits state) on tick 1, crashes on every tick after.
+    def start_flag(name), do: Agent.start_link(fn -> :first end, name: name)
+
+    def detect(_fetched, ctx) do
+      flag = ctx.thresholds["succeeds_then_crashes.flag_name"] |> String.to_existing_atom()
+
+      case Agent.get_and_update(flag, fn v -> {v, :done} end) do
+        :first -> {[], %{seen: true}}
+        :done -> raise "boom on second tick"
+      end
+    end
+
+    def default_thresholds, do: %{"succeeds_then_crashes.flag_name" => "unset"}
+
+    # If apply_on_emitted/3 ever calls this for the module's OWN synthetic
+    # :detector_crashed alert (source is runner-stamped provenance, not an
+    # alert this module produced), the process dictionary flag flips.
+    def on_emitted(state, _alert) do
+      Process.put(:succeeds_then_crashes_on_emitted_called, true)
+      state
+    end
+  end
+
+  describe "review fix: synthetic detector_crashed/detector_invalid alerts skip on_emitted/2" do
+    test "a detector's own on_emitted/2 is never invoked for its synthetic crash alert" do
+      flag = :"succeeds_then_crashes_#{System.unique_integer([:positive])}"
+      {:ok, _} = SucceedsThenCrashesDetector.start_flag(flag)
+      Process.delete(:succeeds_then_crashes_on_emitted_called)
+
+      %{state: state, clock: clock} =
+        start_scope(
+          config: %{
+            custom_detectors: [SucceedsThenCrashesDetector],
+            cooldown_minutes: 0,
+            thresholds: %{"succeeds_then_crashes.flag_name" => to_string(flag)}
+          }
+        )
+
+      # Tick 1: detect/2 succeeds — state commits under the module's key.
+      {_, state} = decode_reply(tick(state))
+
+      # Tick 2: detect/2 crashes. The runner's synthetic :detector_crashed
+      # alert is source-stamped with this module, which DOES export
+      # on_emitted/2 and DOES already have committed det state from tick 1
+      # — exactly the shape that would slip past a naive source-only check.
+      advance(clock, 60_000)
+      {_, _state} = decode_reply(tick(state))
+
+      refute Process.get(:succeeds_then_crashes_on_emitted_called)
     end
   end
 end

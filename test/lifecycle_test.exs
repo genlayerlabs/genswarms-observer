@@ -38,8 +38,8 @@ defmodule Genswarms.Observer.LifecycleTest do
       )
   end
 
-  test "same-key alerts within one batch dedupe to the first" do
-    %{emit: emit} =
+  test "same-key alerts within one batch dedupe to the first and count as suppressed" do
+    %{emit: emit, suppressed: suppressed} =
       Lifecycle.process(
         [alert(:stall, {"w", :stall}), alert(:stall, {"w", :stall})],
         %{},
@@ -50,6 +50,7 @@ defmodule Genswarms.Observer.LifecycleTest do
       )
 
     assert length(emit) == 1
+    assert suppressed == 1
   end
 
   test "overflow coalesces into one summary and stamps only emitted keys" do

@@ -38,17 +38,16 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
   # Minimal wingston-shaped feed event (provenance above).
   defp ev(kind, cid, ms, extra \\ %{}) do
-    # Generate unique seq based on ms so distinct events don't collide on seq.
-    # Real wires stamp monotonic per-session seqs; this deterministic mapping
-    # ensures test fixtures behave like real ones (distinct events → distinct seqs).
-    seq = 1 + abs(Kernel.div(ms, 1000))
+    # Real wires stamp monotonic per-session seqs; a unique_integer keeps
+    # fixtures distinct even when two events share the same `ms` (deriving
+    # seq from ms, e.g. `1 + abs(div(ms, 1000))`, collided within a second).
+    seq = System.unique_integer([:positive, :monotonic])
     Map.merge(%{"kind" => kind, "cid" => cid, "seq" => seq, "ts" => ts(ms)}, extra)
   end
 
   # Full micromarkets-shaped feed event (provenance above).
   defp mm_ev(kind, cid, ms, extra) do
-    # Generate unique seq based on ms like ev() does
-    seq = 1 + abs(Kernel.div(ms, 1000))
+    seq = System.unique_integer([:positive, :monotonic])
     Map.merge(
       %{
         "kind" => kind,
@@ -545,7 +544,7 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       # below threshold raises nothing, but the failure is now REMEMBERED
       # (accumulate-and-prune state) for the cross-tick window
-      assert {[], %{fail_ts: %{"tg:2:0" => [{{:seq, 1}, 0}]}}} = DeliveryFailureBurst.detect(f, ctx)
+      assert {[], %{fail_ts: %{"tg:2:0" => [{{:seq, _}, 0}]}}} = DeliveryFailureBurst.detect(f, ctx)
     end
 
     test "events outside the window are excluded from the count" do
@@ -663,11 +662,17 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       # the feed cursor is session-local — a restart replays the ring into
       # state that already counted those failures. 2 real failures must stay
       # 2, not become 4 and cross the threshold falsely.
-      fail = fn ms -> ev("reply_sent", "tg:2:0", ms, %{"ok" => false}) end
+      # A replay is the IDENTICAL wire event — same seq — so build the two
+      # events once and feed the same maps back in (ev/4 now mints a fresh
+      # seq per call, as the real feed does for genuinely new events).
+      failures = [
+        ev("reply_sent", "tg:2:0", 0, %{"ok" => false}),
+        ev("reply_sent", "tg:2:0", 50_000, %{"ok" => false})
+      ]
 
-      {[], s1} = burst_tick(nil, [fail.(0), fail.(50_000)], 60_000)
+      {[], s1} = burst_tick(nil, failures, 60_000)
       # restart: the same two events replay in one batch
-      assert {[], s2} = burst_tick(s1, [fail.(0), fail.(50_000)], 70_000)
+      assert {[], s2} = burst_tick(s1, failures, 70_000)
       assert s2.fail_ts |> Map.fetch!("tg:2:0") |> length() == 2
     end
 

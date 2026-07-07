@@ -19,6 +19,12 @@
   one `:detector_quarantined` alert) instead of crash-looping (F2).
 - Threshold overrides are type-validated against each module's defaults
   (numeric strings coerced, mismatches fall back) (F6).
+- The tick reply's `suppressed` counter now counts every dropped alert
+  (previously 0/1 per overflow) — dashboards/parsers watching it will see
+  a step change.
+- `relay_log.allowed` now records whether a transcript was actually
+  SERVED: a gate-allowed but failed fetch logs `allowed: false` with
+  reason "fetch failed" (previously logged `allowed: true`).
 
 ### Fixed
 - `topics_stale`: no nightly false alarm in the midnight→producer-close
