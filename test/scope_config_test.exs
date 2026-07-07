@@ -240,6 +240,31 @@ defmodule Genswarms.Observer.ScopeConfigTest do
 
   # ── Task 6: signal_rules — operator config, fail-CLOSED ──────────────────
 
+  test "atom-keyed rules (the engine's JSON->config atomization) boot and validate" do
+    # Exact shape from the 2026-07-07 live boot crash: the engine atomizes
+    # config map KEYS (values untouched), so a JSON-authored operator rule
+    # arrives as %{block: ..., when: %{op: ...}}. Fail-closed validation must
+    # see the author's string-keyed shape (stringify_deep in scope.ex).
+    config =
+      base_config(%{
+        signal_rules: [
+          %{
+            block: "metrics_today",
+            id: "smoke_test",
+            severity: "info",
+            card: "observer smoke test",
+            when: %{op: "gte", lhs: "now", rhs: 0}
+          }
+        ]
+      })
+
+    {:ok, state} = Scope.init(config)
+    assert %{"metrics_today" => [rule]} = state.signal_rules_by_block
+    assert rule["id"] == "smoke_test"
+    assert rule["when"] == %{"op" => "gte", "lhs" => "now", "rhs" => 0}
+  end
+
+
   test "an invalid signal_rules operator rule raises at init, naming the rule id" do
     config =
       base_config(%{

@@ -1627,6 +1627,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   # — see run_signals/4). Boot-only, never re-read, NEVER x-mutable.
   defp build_signal_rules!(entries) when is_list(entries) do
     entries
+    |> Enum.map(&stringify_deep/1)
     |> Enum.with_index()
     |> Enum.reduce(%{}, fn {entry, idx}, acc ->
       block_key = signal_rule_entry_block!(entry, idx)
@@ -1647,6 +1648,17 @@ defmodule Genswarms.Observer.Objects.Scope do
   defp build_signal_rules!(other) do
     raise ArgumentError, "signal_rules: expected a list, got #{inspect(other)}"
   end
+
+  # The engine's config plumbing atomizes map KEYS on the way into an
+  # object's config (JSON IR -> atom keys, values untouched), so operator
+  # rules arrive here atom-keyed even though the author wrote JSON.
+  # Deep-stringify keys so the grammar validation sees the shape the
+  # author wrote. Caught LIVE on first boot: the fail-closed raise fired
+  # on the engine path while direct-init tests (string keys) passed —
+  # config readers in this module must always be key-shape-agnostic.
+  defp stringify_deep(%{} = m), do: Map.new(m, fn {k, v} -> {to_string(k), stringify_deep(v)} end)
+  defp stringify_deep(l) when is_list(l), do: Enum.map(l, &stringify_deep/1)
+  defp stringify_deep(v), do: v
 
   defp signal_rule_entry_block!(entry, idx) when is_map(entry) do
     case Map.get(entry, "block") do
