@@ -106,7 +106,7 @@ defmodule Genswarms.Observer.Detectors.TopicsStale do
 
   # F3: the cutoff date is derived from (now - grace_hours), not raw now.
   # The producer's promise is "yesterday's period closes shortly AFTER
-  # midnight" (wingston: 00:15 UTC cron) — evaluating against the raw UTC
+  # midnight" (e.g. a nightly close cron minutes past 00:00) — evaluating against the raw UTC
   # date in that gap would false-alarm nightly. Promise-vs-observation:
   # never evaluate a schedule the producer hasn't had time to keep.
   defp stale?(period_id, now_ms, thresholds) do

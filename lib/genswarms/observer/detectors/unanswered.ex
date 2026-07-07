@@ -8,15 +8,10 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
   `request_open`/`reply_sent` vocabulary. NOT `fetched.events` (engine-raw
   LogStore), which the legacy health detectors keep.
 
-  Real wire event shape, identical across both known hosts (see the
-  provenance block in detectors_ux_test.exs):
-
-  - wingston `objects/event_feed.ex:164-177` — `%{kind, cid, ok?, seq, ts}`
-    with `ts = System.system_time(:millisecond) / 1000`; string keys after
-    the JSON hop.
-  - micromarkets `dashboard/feed/event_feed.ex:317-329` (`base/2`) —
-    `%{"kind", "cid", "ok"?, "seq", "ts", ...log-store extras}` with `"ts"`
-    from `unix_ts/1` (`:479-480`).
+  Real wire event shape, identical across both reference hosts (see the
+  provenance block in detectors_ux_test.exs): `%{kind, cid, ok?, seq, ts}`
+  with `ts` = float unix seconds; string keys after the JSON hop. Hosts may
+  append log-store extras — ignored here.
 
   So on our side: `%{"kind" => "request_open", "cid" => c, "ts" => secs}`,
   `%{"kind" => "reply_sent", "cid" => c, "ok" => bool, "ts" => secs}` —
@@ -82,8 +77,8 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
 
   def on_emitted(state, _alert), do: state
 
-  # The EventsSource contract guarantees oldest-first ascending (wingston
-  # vendor/genswarms-dashboard/backend README §EventsSource: "Events with
+  # The EventsSource contract guarantees oldest-first ascending (dashboard
+  # backend README §EventsSource: "Events with
   # seq > since, oldest first"), so the fold below is order-correct BY
   # CONTRACT. This sort is cheap insurance against a non-compliant host:
   # folding a reply BEFORE its open would delete a not-yet-tracked cid and
@@ -176,15 +171,15 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
     }
   end
 
-  # Feed events name themselves via "kind" on both wires (wingston event
-  # registry / micromarkets base/2). No "event_type" fallback: on the
-  # micromarkets wire that key carries the RAW log type ("telegram_reply",
-  # "message_received", ...), never the display vocabulary.
+  # Feed events name themselves via "kind" on both reference wires. No
+  # "event_type" fallback: on one of them that key carries the RAW log
+  # type ("telegram_reply", "message_received", ...), never the display
+  # vocabulary.
   defp kind(ev) when is_map(ev), do: ev["kind"]
   defp kind(_), do: nil
 
-  # "ts" = float unix SECONDS on both wires (wingston event_feed.ex:171,
-  # micromarkets event_feed.ex:479-480) — the feed carries no ISO8601
+  # "ts" = float unix SECONDS on both reference wires (provenance:
+  # detectors_ux_test.exs) — the feed carries no ISO8601
   # "timestamp"; that field belongs to the LogStore /events surface.
   defp event_ms(%{"ts" => ts}) when is_number(ts), do: round(ts * 1000)
   defp event_ms(_), do: nil

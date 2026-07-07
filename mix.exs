@@ -64,7 +64,7 @@ defmodule GenswarmsObserver.MixProject do
     end
   end
 
-  # packages: env override > sibling checkout > pinned git tag (wingston pattern)
+  # packages: env override > sibling checkout > pinned git tag
   defp sibling_or_github(app, org, repo, tag) do
     override = System.get_env(String.upcase("#{app}_PATH"))
     sibling = Path.expand("../#{repo}", __DIR__)

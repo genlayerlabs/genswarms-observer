@@ -39,7 +39,7 @@ defmodule Genswarms.Observer.Digest do
   bounded backlog is always fully cleared in one tick.
 
   `sanitize_label/1` is an independent implementation of the same
-  scrubbing rules wingston applies at the source (NFC normalize, strip
+  scrubbing rules hosts apply at the source (NFC normalize, strip
   bidi/control/zero-width/format chars, remove URL/email/@handle
   fragments and 6+-digit runs, collapse whitespace, cap at 80) — defense
   in depth against a compromised or buggy upstream. It deliberately does
@@ -51,7 +51,7 @@ defmodule Genswarms.Observer.Digest do
   @period_re ~r/^\d{4}-\d{2}-\d{2}$/
   @label_cap 80
 
-  # Order matters (lesson from the wingston-side review): strip
+  # Order matters (lesson from the host-side review): strip
   # control/bidi/zero-width/format chars BEFORE scrubbing structured PII.
   # A zero-width char or bidi override spliced into a URL or phone number
   # defeats the PII regex on a single scrub-first pass, then reassembles

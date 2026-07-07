@@ -5,7 +5,7 @@ defmodule Genswarms.Observer.Client.Fake do
   Fixture shape (per observed swarm name):
 
       {:ok, pid} = Client.Fake.start_link(%{
-        "wingston" => %{
+        "myswarm" => %{
           dashboard: {:ok, envelope_map},
           events: {:ok, [event_map]},
           events_feed: {:ok, %{events: [display_event_map], seq: 7}},

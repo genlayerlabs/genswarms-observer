@@ -8,17 +8,15 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     with `cids: [cid]` so the swarm-level cooldown (Scope) dedupes repeats
     across ticks.
   - Swarm-level: `>= "delivery_failure.count"` `reply_failed` events inside
-    the same window -> `:reply_failed_burst`, no cids. On wingston a
-    `reply_failed` never carries a cid (the target could not be resolved);
-    on micromarkets it sometimes does — either way it is counted at swarm
-    level and any cid is ignored.
+    the same window -> `:reply_failed_burst`, no cids. Some hosts never put
+    a cid on `reply_failed` (the target could not be resolved); others
+    sometimes do — either way it is counted at swarm level and any cid is
+    ignored.
 
   Consumes `fetched.feed` (`GET /api/swarms/:name/events/feed`) — the only
   surface carrying `reply_sent`/`reply_failed`. Real wire shape (identical
-  on both known hosts; full provenance in detectors_ux_test.exs):
-  `%{"kind" => k, "cid" => c?, "ok" => bool?, "ts" => float unix SECONDS}` —
-  wingston `objects/event_feed.ex:164-177` (+ registry `:38-39`),
-  micromarkets `dashboard/feed/event_feed.ex:317-329` (`"ts"` via `:479-480`).
+  on both reference hosts; full provenance in detectors_ux_test.exs):
+  `%{"kind" => k, "cid" => c?, "ok" => bool?, "ts" => float unix SECONDS}`.
 
   A missing `"ok"` on `reply_sent` counts as delivered (does not count
   towards the burst). `"kind"` names the event on both wires. Events with
@@ -136,10 +134,10 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
     end)
   end
 
-  # F9: dedupe by the wire's seq (unique + monotonic on both known wires:
-  # wingston event_feed.ex stamps seq on every display event, micromarkets
-  # base/2 ditto) — exact-ts collapsed two DISTINCT same-millisecond
-  # reply_faileds into one. ts remains the fallback key for a seq-less host.
+  # F9: dedupe by the wire's seq (unique + monotonic on both reference
+  # wires, stamped on every display event) — exact-ts collapsed two DISTINCT
+  # same-millisecond reply_faileds into one. ts remains the fallback key for
+  # a seq-less host.
   defp dedupe_key(%{"seq" => seq}, _ms) when is_integer(seq), do: {:seq, seq}
   defp dedupe_key(_ev, ms), do: {:ts, ms}
 
@@ -226,8 +224,8 @@ defmodule Genswarms.Observer.Detectors.DeliveryFailureBurst do
   defp kind(ev) when is_map(ev), do: ev["kind"]
   defp kind(_), do: nil
 
-  # "ts" = float unix SECONDS on both wires (wingston event_feed.ex:171,
-  # micromarkets event_feed.ex:479-480).
+  # "ts" = float unix SECONDS on both reference wires (provenance:
+  # detectors_ux_test.exs).
   defp event_ms(%{"ts" => ts}) when is_number(ts), do: round(ts * 1000)
   defp event_ms(_), do: nil
 end

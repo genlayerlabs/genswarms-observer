@@ -33,8 +33,8 @@ defmodule Genswarms.Observer.Objects.Scope do
     and customs) and raises on a threshold KEY COLLISION across modules
     (two modules declaring the same key); an undeclared-but-referenced
     threshold key can't be known statically and is NOT checked here.
-  - Dedupe + cooldown per alert `key` (default `{swarm, type}`, wingston
-    roster pattern): a persisting condition alerts once per cooldown window,
+  - Dedupe + cooldown per alert `key` (default `{swarm, type}`, the
+    roster-nudge pattern): a persisting condition alerts once per cooldown window,
     not once per tick. This POLICY lives in `Genswarms.Observer.Lifecycle`
     (pure, called from `tick/1`); `Scope` threads the state through and
     executes the resulting deliveries. A per-swarm-per-tick alert budget
@@ -412,18 +412,18 @@ defmodule Genswarms.Observer.Objects.Scope do
       },
       status: %{
         input: ~s({"action":"status"}),
-        output: ~s({"ok":true,"watching":["wingston"],"last_tick_ms":123,"recent_alerts":[...]})
+        output: ~s({"ok":true,"watching":["myswarm"],"last_tick_ms":123,"recent_alerts":[...]})
       },
       get_dashboard: %{
-        input: ~s({"action":"get_dashboard","swarm":"wingston"}),
+        input: ~s({"action":"get_dashboard","swarm":"myswarm"}),
         output: "the observed swarm's live dashboard envelope"
       },
       get_events: %{
-        input: ~s({"action":"get_events","swarm":"wingston"}),
+        input: ~s({"action":"get_events","swarm":"myswarm"}),
         output: ~s({"ok":true,"events":[...]})
       },
       get_session_history: %{
-        input: ~s({"action":"get_session_history","swarm":"wingston","cid":"tg:1:0"}),
+        input: ~s({"action":"get_session_history","swarm":"myswarm","cid":"tg:1:0"}),
         output:
           ~s({"ok":true,"history":{...}} — cid must be named by a fresh built-in alert, 3 relays max)
       }
@@ -589,10 +589,10 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   # Drain page budget: the server pages the feed (the client asks for 500
-  # per page, and a host may clamp lower — micromarkets caps limit at 1_000
-  # while its ring holds 5_000, so "one huge read" is NOT reliably
-  # achievable). 10 pages × 500 = 5_000 covers both known rings (wingston
-  # 4_096, micromarkets 5_000) while bounding a pathological feed. Bounds
+  # per page, and a host may clamp lower — one reference host caps limit at
+  # 1_000 while its ring holds 5_000, so "one huge read" is NOT reliably
+  # achievable). 10 pages × 500 = 5_000 covers the known host ring sizes
+  # (4_096 and 5_000) while bounding a pathological feed. Bounds
   # EVERY read, not just the first — see Ingest's moduledoc (F5):
   # steady-state reads drain to head exactly like the first read.
   @feed_max_pages 10

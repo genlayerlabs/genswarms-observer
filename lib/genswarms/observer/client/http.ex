@@ -9,12 +9,12 @@ defmodule Genswarms.Observer.Client.Http do
 
   # Explicit feed page size. The dashboard route (vendored backend plug.ex,
   # events/feed) defaults its "limit" param to 500 and warns "the host impl
-  # may clamp limit tighter" — micromarkets clamps at 1_000. 500 pins the
-  # page size we already ride implicitly (same as the route default, under
-  # every known host clamp, so no wire behavior changes) instead of
+  # may clamp limit tighter" — one reference host clamps at 1_000. 500 pins
+  # the page size we already ride implicitly (same as the route default,
+  # under every known host clamp, so no wire behavior changes) instead of
   # coupling it to someone else's constant; Scope's first-read drain sizes
-  # its 10-page budget against this value (10 × 500 = 5_000 ≥ both known
-  # rings: wingston 4_096, micromarkets 5_000).
+  # its 10-page budget against this value (10 × 500 = 5_000 ≥ the known
+  # host ring sizes, 4_096 and 5_000).
   @feed_limit 500
 
   @impl true
