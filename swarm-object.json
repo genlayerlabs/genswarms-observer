@@ -97,6 +97,11 @@
       "deliver_fn": {
         "type": "string",
         "description": "Injectable delivery seam to the sender (tests only; default engine ObjectServer)."
+      },
+      "signal_rules": {
+        "type": "array",
+        "description": "Operator-configured declarative health_rules (see README 'Health rules (declarative)'). Each entry carries its own \"block\" key (the dashboard extension key it evaluates against) plus the v1 rule grammar (id/severity/card/each/where/when). Grouped by block and validated at init/1 with the same grammar package-shipped rules use, but FAIL-CLOSED: a malformed rule raises at boot, naming it — these are the operator's own trusted config, unlike remote package rules (fail-soft). Boot-time only, never re-read, NEVER x-mutable.",
+        "items": { "type": "object" }
       }
     },
     "required": ["registry"]

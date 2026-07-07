@@ -1293,4 +1293,237 @@ defmodule Genswarms.Observer.ScopeTest do
       refute Process.get(:succeeds_then_crashes_on_emitted_called)
     end
   end
+
+  # ── Task 6: Signals stage ────────────────────────────────────────────────
+  #
+  # Fixtures copied verbatim from the plan / signals_test.exs (provenance:
+  # docs/superpowers/plans/2026-07-07-observability-stages-2-4.md, Task 1 +
+  # Task 3) so the wiring is proven against the actual shipped shapes.
+  describe "Task 6: Signals stage" do
+    @cron_missed_tick_rule %{
+      "id" => "missed_tick",
+      "severity" => "warn",
+      "card" => "cron job {name} did not run (overdue past grace)",
+      "each" => "jobs",
+      "where" => %{"op" => "eq", "lhs" => %{"path" => "state"}, "rhs" => %{"lit" => "active"}},
+      "when" => %{
+        "op" => "gt",
+        "lhs" => "now",
+        "rhs" => %{"add" => [%{"path" => "next_run_at_ms"}, 1_800_000]}
+      }
+    }
+
+    @poll_conflict_rule %{
+      "id" => "poll_conflict",
+      "severity" => "warn",
+      "card" => "getUpdates 409 conflict — two pollers are fighting over this bot token",
+      "when" => %{"op" => "gt", "lhs" => %{"delta" => "conflict_count"}, "rhs" => 0}
+    }
+
+    defp cron_envelope(jobs) do
+      healthy_dashboard()
+      |> Map.put("extensions", %{
+        "cron" => %{"v" => 1, "jobs" => jobs, "health_rules" => [@cron_missed_tick_rule]}
+      })
+    end
+
+    defp cron_envelope(jobs, extra_rules) do
+      healthy_dashboard()
+      |> Map.put("extensions", %{
+        "cron" => %{"v" => 1, "jobs" => jobs, "health_rules" => extra_rules}
+      })
+    end
+
+    defp poller_envelope(conflict_count) do
+      healthy_dashboard()
+      |> Map.put("extensions", %{
+        "telegram_poller" => %{
+          "v" => 1,
+          "conflict_count" => conflict_count,
+          "health_rules" => [@poll_conflict_rule]
+        }
+      })
+    end
+
+    defp fixture(envelope), do: %{"wingston" => %{dashboard: {:ok, envelope}, events: {:ok, []}}}
+
+    test "an overdue active job fires one health_rule alert through the normal pipeline; a paused overdue job doesn't" do
+      envelope =
+        cron_envelope([
+          %{"name" => "sync", "state" => "active", "next_run_at_ms" => 0},
+          %{"name" => "paused_job", "state" => "paused", "next_run_at_ms" => 0}
+        ])
+
+      %{state: state, outbox: outbox} = start_scope(fixture: fixture(envelope))
+
+      {reply, _state} = decode_reply(tick(state))
+      assert reply["alerts"] == 1
+
+      [card] = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+      assert card["card"]["title"] =~ "health_rule"
+      assert Enum.any?(card["card"]["blocks"], &(&1["text"] =~ "sync"))
+    end
+
+    test "a paused-only overdue job raises nothing" do
+      envelope = cron_envelope([%{"name" => "paused_job", "state" => "paused", "next_run_at_ms" => 0}])
+      %{state: state, outbox: outbox} = start_scope(fixture: fixture(envelope))
+
+      {reply, _state} = decode_reply(tick(state))
+      assert reply["alerts"] == 0
+      assert sent(outbox) == []
+    end
+
+    test "delta rule: first tick no alert, second tick (increase) alerts, flat third tick doesn't" do
+      %{state: state, fake: fake, clock: clock, outbox: outbox} =
+        start_scope(fixture: fixture(poller_envelope(0)))
+
+      {reply1, state} = decode_reply(tick(state))
+      assert reply1["alerts"] == 0
+
+      Client.Fake.put(fake, "wingston", %{dashboard: {:ok, poller_envelope(1)}, events: {:ok, []}})
+      advance(clock, 1_000)
+      {reply2, state} = decode_reply(tick(state))
+      assert reply2["alerts"] == 1
+
+      Client.Fake.put(fake, "wingston", %{dashboard: {:ok, poller_envelope(1)}, events: {:ok, []}})
+      advance(clock, 1_000)
+      {reply3, _state} = decode_reply(tick(state))
+      assert reply3["alerts"] == 0
+
+      cards = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+      assert Enum.count(cards, &(&1["card"]["title"] =~ "health_rule")) == 1
+    end
+
+    test "malformed package rules (17 rules) drop that block's alerts, name it in :signals health, other blocks still evaluate" do
+      broken_rules = for i <- 1..17, do: %{@cron_missed_tick_rule | "id" => "r#{i}"}
+
+      envelope =
+        cron_envelope(
+          [%{"name" => "sync", "state" => "active", "next_run_at_ms" => 0}],
+          broken_rules
+        )
+        |> Map.update!("extensions", fn ext ->
+          Map.put(ext, "telegram_poller", %{
+            "v" => 1,
+            "health_rules" => [
+              %{"id" => "always_fires", "card" => "c", "when" => %{"op" => "gt", "lhs" => "now", "rhs" => 0}}
+            ]
+          })
+        end)
+
+      %{state: state, outbox: outbox} = start_scope(fixture: fixture(envelope))
+      {reply, state} = decode_reply(tick(state))
+
+      # cron's 17-rule block never fires; telegram_poller's always_fires rule does.
+      assert reply["alerts"] == 1
+      [card] = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+      assert card["card"]["title"] =~ "health_rule"
+      refute card["card"]["title"] =~ "cron"
+
+      assert %{"wingston" => %{signals: %{last_error: err}}} = state.health
+      assert err =~ "cron"
+      assert err =~ "17"
+    end
+
+    test "item_key cap: 15 matching items feed no more than 10 signal alerts into the per-swarm budget" do
+      jobs = for i <- 1..15, do: %{"name" => "job#{i}", "state" => "active", "next_run_at_ms" => 0}
+      envelope = cron_envelope(jobs)
+
+      %{state: state, outbox: outbox} = start_scope(fixture: fixture(envelope))
+      {reply, _state} = decode_reply(tick(state))
+
+      # 6 kept by the per-swarm alert budget + 1 coalesced summary.
+      assert reply["alerts"] == 7
+
+      cards = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+      coalesced = Enum.find(cards, &(&1["card"]["title"] =~ "alerts_coalesced"))
+      assert coalesced
+
+      evidence_block = Enum.find(coalesced["card"]["blocks"], &String.starts_with?(&1["text"], "evidence:"))
+      # 10 (the per-rule cap) - 6 (the budget) = 4 dropped, not 15 - 6 = 9.
+      assert evidence_block["text"] =~ ~s("health_rule":4)
+    end
+
+    test "operator signal_rules run against a block even without package health_rules" do
+      envelope = healthy_dashboard() |> Map.put("extensions", %{"metrics_today" => %{"widgets" => 3}})
+
+      %{state: state, outbox: outbox} =
+        start_scope(
+          fixture: fixture(envelope),
+          config: %{
+            signal_rules: [
+              %{
+                "block" => "metrics_today",
+                "id" => "widget_check",
+                "card" => "widgets={widgets}",
+                "when" => %{"op" => "gt", "lhs" => %{"path" => "widgets"}, "rhs" => 0}
+              }
+            ]
+          }
+        )
+
+      {reply, _state} = decode_reply(tick(state))
+      assert reply["alerts"] == 1
+
+      [card] = sent(outbox) |> Enum.map(&Jason.decode!(&1.content))
+      assert Enum.any?(card["card"]["blocks"], &(&1["text"] =~ "widgets=3"))
+    end
+  end
+
+  describe "Task 6: sovereign rules_gone (with the 2-tick debounce)" do
+    @gone_test_rule %{
+      "id" => "poll_conflict",
+      "severity" => "warn",
+      "card" => "getUpdates 409 conflict",
+      "when" => %{"op" => "gt", "lhs" => %{"delta" => "conflict_count"}, "rhs" => 0}
+    }
+
+    defp present_poller_envelope do
+      healthy_dashboard()
+      |> Map.put("extensions", %{
+        "telegram_poller" => %{"v" => 1, "conflict_count" => 0, "health_rules" => [@gone_test_rule]}
+      })
+    end
+
+    defp absent_poller_envelope, do: healthy_dashboard()
+
+    test "1 absent tick doesn't fire; the 2nd consecutive dashboard-ok absent tick does; a fetch-error tick doesn't count" do
+      %{state: state, fake: fake, clock: clock, outbox: outbox} =
+        start_scope(fixture: %{"wingston" => %{dashboard: {:ok, present_poller_envelope()}, events: {:ok, []}}})
+
+      # tick1: block present — establishes rules_seen.
+      {_reply1, state} = decode_reply(tick(state))
+      refute Enum.any?(sent(outbox), &(Jason.decode!(&1.content)["card"]["title"] =~ "health_rules_gone"))
+
+      # tick2: block absent (1st miss) — no gone alert yet.
+      Client.Fake.put(fake, "wingston", %{dashboard: {:ok, absent_poller_envelope()}, events: {:ok, []}})
+      advance(clock, 1_000)
+      {_reply2, state} = decode_reply(tick(state))
+      refute Enum.any?(sent(outbox), &(Jason.decode!(&1.content)["card"]["title"] =~ "health_rules_gone"))
+
+      # tick3: a fetch error — resets nothing, counts nothing (no-verdict).
+      Client.Fake.put(fake, "wingston", %{dashboard: {:error, :econnrefused}, events: {:ok, []}})
+      advance(clock, 1_000)
+      {_reply3, state} = decode_reply(tick(state))
+      refute Enum.any?(sent(outbox), &(Jason.decode!(&1.content)["card"]["title"] =~ "health_rules_gone"))
+
+      # tick4: block absent again with dashboard OK — this is the 2nd
+      # CONSECUTIVE dashboard-ok miss (tick3's error didn't count) — fires.
+      Client.Fake.put(fake, "wingston", %{dashboard: {:ok, absent_poller_envelope()}, events: {:ok, []}})
+      advance(clock, 1_000)
+      {_reply4, _state} = decode_reply(tick(state))
+      assert Enum.any?(sent(outbox), &(Jason.decode!(&1.content)["card"]["title"] =~ "health_rules_gone"))
+    end
+
+    test "a block that never goes away never fires rules_gone" do
+      %{state: state, clock: clock, outbox: outbox} =
+        start_scope(fixture: %{"wingston" => %{dashboard: {:ok, present_poller_envelope()}, events: {:ok, []}}})
+
+      {_reply1, state} = decode_reply(tick(state))
+      advance(clock, 1_000)
+      {_reply2, _state} = decode_reply(tick(state))
+
+      refute Enum.any?(sent(outbox), &(Jason.decode!(&1.content)["card"]["title"] =~ "health_rules_gone"))
+    end
+  end
 end

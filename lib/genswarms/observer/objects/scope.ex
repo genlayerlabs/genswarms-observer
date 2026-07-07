@@ -6,6 +6,10 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   Tick pipeline (per swarm, commit-together semantics):
     Ingest.fetch      → data + a PROPOSED feed cursor (never committed there)
+    Signals stage     → declarative health_rules alerts (package + operator
+                        rules, same evaluator) + the sovereign rules_gone
+                        check; alerts join the SAME Lifecycle batch as
+                        detector/quarantine alerts (see run_signals/4)
     DetectorRunner.run → alerts + per-module states (commit-on-success)
     quarantine        → 3 consecutive failures disable a module + drop its state
     cursor commit     → ONLY if every active detector succeeded this tick
@@ -33,6 +37,21 @@ defmodule Genswarms.Observer.Objects.Scope do
     and customs) and raises on a threshold KEY COLLISION across modules
     (two modules declaring the same key); an undeclared-but-referenced
     threshold key can't be known statically and is NOT checked here.
+  - Task 6: `Genswarms.Observer.Signals` evaluates the declarative
+    `health_rules` grammar (see README "Health rules (declarative)") over
+    two sources with different trust: package-shipped rules (inside a
+    dashboard extension block's `"health_rules"` key — remote data) are
+    fail-SOFT, a malformed block's rules are dropped and named in the
+    `:signals` per-stage health, every other block still evaluates;
+    operator rules (config `signal_rules`, boot-only, NEVER x-mutable,
+    grouped by their `"block"`) are fail-CLOSED — an invalid one raises at
+    `init/1`, same trust class as `custom_detectors`. Delta samples are
+    swarm-scoped and persisted (`state.signals`); the sovereign
+    `rules_gone` check watches which PACKAGE blocks are actually
+    publishing `health_rules` this tick (never operator-configured
+    blocks, which are static config) and fires only after 2 CONSECUTIVE
+    dashboard-fetched-ok ticks with the block absent — see
+    `run_signals/4`.
   - Dedupe + cooldown per alert `key` (default `{swarm, type}`, the
     roster-nudge pattern): a persisting condition alerts once per cooldown window,
     not once per tick. This POLICY lives in `Genswarms.Observer.Lifecycle`
@@ -77,6 +96,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   alias Genswarms.Observer.Ingest
   alias Genswarms.Observer.Lifecycle
   alias Genswarms.Observer.Outbox
+  alias Genswarms.Observer.Signals
 
   require Logger
 
@@ -84,6 +104,15 @@ defmodule Genswarms.Observer.Objects.Scope do
   @alert_budget_per_swarm 6
   @period_re ~r/^\d{4}-\d{2}-\d{2}$/
   @quarantine_after 3
+
+  # Task 6 controller addendum: `:health_rule` / `:health_rules_gone`
+  # (Signals stage) are deliberately absent from `@builtin_relay_types`
+  # below AND never stamp a `:source` module — both relay gates
+  # (`@builtin_relay_types` membership below and `@builtin_detector_modules`
+  # provenance further down) already exclude them from
+  # `get_session_history` eligibility. Documentation only, no code change.
+  @item_key_max 64
+  @alerts_per_rule_cap 10
 
   # O6: cid-bound diagnosis relay. The eligible-type set is a literal list,
   # not derived from the loaded modules — deriving it would mean executing
@@ -137,6 +166,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     custom_detectors = resolve_custom_detectors!(cfg(config, :custom_detectors, []))
     check_threshold_collisions!(@builtin_detectors ++ Enum.map(custom_detectors, & &1.module))
+    signal_rules_by_block = build_signal_rules!(cfg(config, :signal_rules, []))
 
     state = %{
       swarm_name: swarm_name,
@@ -167,6 +197,11 @@ defmodule Genswarms.Observer.Objects.Scope do
       # init, NEVER x-mutable (loading third-party code is the operator's
       # explicit allowlist, not a hot-tunable).
       custom_detectors: custom_detectors,
+      # Task 6: operator-configured health_rules, grouped by their "block"
+      # key, already validated fail-CLOSED by build_signal_rules!/1 above
+      # (raises at boot on a malformed entry — same trust class as
+      # custom_detectors). Boot-only, never re-read, NEVER x-mutable.
+      signal_rules_by_block: signal_rules_by_block,
       # Nested per swarm, then per detector module: `det[swarm][module]`.
       # Isolates one detector's state from another's under DetectorRunner.
       det: %{},
@@ -218,7 +253,15 @@ defmodule Genswarms.Observer.Objects.Scope do
       # replaying), and one :detector_quarantined alert goes through the
       # normal pipeline. Session-local by design: an observer restart is
       # the operator's reset lever.
-      quarantine: %{}
+      quarantine: %{},
+      # Task 6: `Genswarms.Observer.Signals` bookkeeping. `samples` is
+      # `%{{swarm, block_key, rule_id, path} => number}` (delta evaluator
+      # state, PERSISTED — see store.ex); `rules_seen` is
+      # `%{swarm => MapSet.t(block_key)}` and `rules_miss` is
+      # `%{swarm => %{block_key => consecutive_miss_count}}`, the sovereign
+      # rules_gone debounce (2 consecutive dashboard-ok misses before
+      # firing). Both loaded/validated in load_store below.
+      signals: %{samples: %{}, rules_seen: %{}, rules_miss: %{}}
     }
 
     {:ok, load_store(state, now_fn.())}
@@ -262,6 +305,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     det = saved |> Map.get(:det, %{}) |> validate_det()
     last_alert = saved |> Map.get(:last_alert, %{}) |> validate_last_alert(now)
     seen_periods = saved |> Map.get(:seen_periods, %{}) |> validate_seen_periods(now)
+    signals = saved |> Map.get(:signals, %{}) |> validate_signals()
 
     if loaded_seq < state.save_seq do
       Logger.warning(
@@ -273,10 +317,18 @@ defmodule Genswarms.Observer.Objects.Scope do
         | det: det,
           last_alert: last_alert,
           seen_periods: seen_periods,
+          signals: signals,
           pending_alerts: [rollback_alert(state, loaded_seq, now)]
       }
     else
-      %{state | det: det, last_alert: last_alert, seen_periods: seen_periods, save_seq: loaded_seq}
+      %{
+        state
+        | det: det,
+          last_alert: last_alert,
+          seen_periods: seen_periods,
+          signals: signals,
+          save_seq: loaded_seq
+      }
     end
   end
 
@@ -365,6 +417,58 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   defp valid_period?(_, _tomorrow), do: false
 
+  # Task 6: `signals` is opaque to Scope's callers but its own internal
+  # shape IS checked here — a corrupt entry from a hand-edited/older store
+  # must degrade to that piece's empty default, never crash boot or feed
+  # garbage into Signals.evaluate/7 (which trusts its `samples` argument).
+  defp validate_signals(signals) when is_map(signals) do
+    %{
+      samples: validate_signal_samples(Map.get(signals, :samples)),
+      rules_seen: validate_signal_rules_seen(Map.get(signals, :rules_seen)),
+      rules_miss: validate_signal_rules_miss(Map.get(signals, :rules_miss))
+    }
+  end
+
+  defp validate_signals(_), do: %{samples: %{}, rules_seen: %{}, rules_miss: %{}}
+
+  # Keys must be exactly the 4-tuple {swarm, block_key, rule_id, path} of
+  # binaries with a numeric value — anything else (wrong arity, wrong
+  # element types, a non-numeric value) is dropped, not the whole map.
+  defp validate_signal_samples(samples) when is_map(samples) do
+    for {{s, bk, rid, path}, v} <- samples,
+        is_binary(s) and is_binary(bk) and is_binary(rid) and is_binary(path) and is_number(v),
+        into: %{},
+        do: {{s, bk, rid, path}, v}
+  end
+
+  defp validate_signal_samples(_), do: %{}
+
+  defp validate_signal_rules_seen(map) when is_map(map) do
+    for {swarm, set} <- map, is_binary(swarm), into: %{} do
+      valid = set |> periods_to_list() |> Enum.filter(&is_binary/1) |> MapSet.new()
+      {swarm, valid}
+    end
+  end
+
+  defp validate_signal_rules_seen(_), do: %{}
+
+  defp validate_signal_rules_miss(map) when is_map(map) do
+    for {swarm, counts} <- map, is_binary(swarm), into: %{} do
+      valid =
+        case counts do
+          c when is_map(c) ->
+            for {block, n} <- c, is_binary(block), is_integer(n), n >= 0, into: %{}, do: {block, n}
+
+          _ ->
+            %{}
+        end
+
+      {swarm, valid}
+    end
+  end
+
+  defp validate_signal_rules_miss(_), do: %{}
+
   # ── store: save ───────────────────────────────────────────────────────────
 
   defp persist(state) do
@@ -374,6 +478,7 @@ defmodule Genswarms.Observer.Objects.Scope do
       det: state.det,
       last_alert: state.last_alert,
       seen_periods: state.seen_periods,
+      signals: state.signals,
       save_seq: next_seq
     }
 
@@ -489,6 +594,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     orig_det = state.det
     orig_last_alert = state.last_alert
     orig_seen_periods = state.seen_periods
+    orig_signals = state.signals
 
     {state, pending_fired, pending_suppressed} = drain_pending_alerts(state, now)
 
@@ -501,6 +607,8 @@ defmodule Genswarms.Observer.Objects.Scope do
           st
           |> record_fetch_health(swarm, data, now)
           |> record_decode_health(swarm, data, now)
+
+        {st, signal_alerts} = run_signals(st, swarm, data, now)
 
         swarm_det_states = Map.get(st.det, swarm, %{})
 
@@ -529,7 +637,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         %{emit: budgeted, suppressed: tick_suppressed, last_alert: new_last_alert} =
           Lifecycle.process(
-            quarantine_alerts ++ alerts,
+            quarantine_alerts ++ signal_alerts ++ alerts,
             st.last_alert,
             st.cooldown_minutes * 60_000,
             @alert_budget_per_swarm,
@@ -550,7 +658,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     state =
       if state.det != orig_det or state.last_alert != orig_last_alert or
-           state.seen_periods != orig_seen_periods do
+           state.seen_periods != orig_seen_periods or state.signals != orig_signals do
         persist(state)
       else
         state
@@ -663,6 +771,211 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   defp deliver_digest(state, _swarm, _data, _now), do: state
+
+  # ── Signals stage (Task 6): declarative health_rules → alerts ─────────────
+  #
+  # Runs right after `fetch`, BEFORE `DetectorRunner.run` — its alerts join
+  # the SAME `Lifecycle.process` batch as quarantine/detector alerts, so
+  # cooldown/dedupe/budget apply uniformly (see tick/1). Pure grammar
+  # evaluation is `Signals`' job; this function owns the trust split and
+  # the per-swarm state threading:
+  #   - package rules (`block["health_rules"]`) are fail-SOFT: a malformed
+  #     block's rules are dropped and the block is named in this tick's
+  #     `:signals` health error — every OTHER block still evaluates.
+  #   - operator rules (`state.signal_rules_by_block`, already validated
+  #     fail-CLOSED at init/1) always run, even against a block the
+  #     package never annotated with "health_rules" (evaluated against
+  #     `Map.get(extensions, block_key, %{})`, absence-tolerant).
+  #   - delta samples are swarm-scoped and persisted (`state.signals`); a
+  #     block absent this tick is simply not evaluated, so its samples sit
+  #     untouched — a delta rule compares against the last KNOWN reading
+  #     whenever the block reappears (deltas may span blind ticks by
+  #     design; see README "Health rules (declarative)").
+  #   - the sovereign rules_gone check is independent bookkeeping over
+  #     which PACKAGE blocks are actually publishing "health_rules" this
+  #     tick (see advance_rules_gone/4).
+  # Skipped ENTIRELY when the dashboard fetch failed/was unavailable this
+  # tick — no-verdict discipline, matching :decode: samples/rules_seen/
+  # rules_miss are untouched, no :signals health update either.
+  defp run_signals(state, swarm, %{dashboard: {:ok, envelope}}, now) when is_map(envelope) do
+    extensions =
+      case Map.get(envelope, "extensions") do
+        m when is_map(m) -> m
+        _ -> %{}
+      end
+
+    package_block_keys =
+      for {block_key, block} <- extensions,
+          is_binary(block_key),
+          is_map(block),
+          Map.has_key?(block, "health_rules"),
+          into: MapSet.new(),
+          do: block_key
+
+    operator_block_keys = state.signal_rules_by_block |> Map.keys() |> MapSet.new()
+    all_block_keys = MapSet.union(package_block_keys, operator_block_keys)
+
+    swarm_samples = samples_for_swarm(state.signals.samples, swarm)
+
+    {alerts, new_swarm_samples, block_errors} =
+      Enum.reduce(all_block_keys, {[], swarm_samples, []}, fn block_key,
+                                                                {alerts_acc, samples_acc, errs_acc} ->
+        block =
+          case Map.get(extensions, block_key) do
+            m when is_map(m) -> m
+            _ -> %{}
+          end
+
+        {pkg_rules, errs_acc} =
+          if MapSet.member?(package_block_keys, block_key) do
+            case Signals.validate_rules(block["health_rules"]) do
+              {:ok, rules} -> {rules, errs_acc}
+              {:error, reason} -> {[], ["#{block_key}: #{reason}" | errs_acc]}
+            end
+          else
+            {[], errs_acc}
+          end
+
+        operator_rules = Map.get(state.signal_rules_by_block, block_key, [])
+
+        {new_alerts, new_samples} =
+          Signals.evaluate(block_key, block, pkg_rules ++ operator_rules, extensions, samples_acc, swarm, now)
+
+        {alerts_acc ++ new_alerts, new_samples, errs_acc}
+      end)
+
+    state = put_swarm_samples(state, swarm, new_swarm_samples)
+    {state, gone_alerts} = advance_rules_gone(state, swarm, package_block_keys, now)
+    state = record_signals_health(state, swarm, block_errors, now)
+
+    {state, bound_signal_alerts(alerts) ++ gone_alerts}
+  end
+
+  defp run_signals(state, _swarm, _data, _now), do: {state, []}
+
+  defp samples_for_swarm(samples, swarm) do
+    for {{s, block_key, rule_id, path}, v} <- samples,
+        s == swarm,
+        into: %{},
+        do: {{block_key, rule_id, path}, v}
+  end
+
+  defp put_swarm_samples(state, swarm, swarm_samples) do
+    others = for {{s, _bk, _rid, _p}, _v} = entry <- state.signals.samples, s != swarm, into: %{}, do: entry
+    mine = for {{bk, rid, p}, v} <- swarm_samples, into: %{}, do: {{swarm, bk, rid, p}, v}
+    %{state | signals: %{state.signals | samples: Map.merge(others, mine)}}
+  end
+
+  # Sovereign rules_gone: independent of the delta/sample bookkeeping
+  # above. A block that has published "health_rules" (present_keys, this
+  # tick's package blocks) is tracked in rules_seen; once seen, a block
+  # ABSENT from present_keys for 2 CONSECUTIVE dashboard-ok ticks fires
+  # one candidate alert PER TICK thereafter (Lifecycle's cooldown, not
+  # this counter, governs the actual re-fire cadence downstream — same
+  # convention as every other detector-generated candidate). The 2-tick
+  # debounce tolerates a component's brief absence (e.g. telegram_poller
+  # missing for the few seconds a restarting bot process takes to come
+  # back — block-absent-not-stale) without paging on the very first miss.
+  # A dashboard fetch error/unavailable never reaches this function (see
+  # run_signals/4's guard above) — it resets nothing and counts nothing,
+  # exactly as if the tick never happened for this purpose.
+  defp advance_rules_gone(state, swarm, present_keys, now) do
+    seen = Map.get(state.signals.rules_seen, swarm, MapSet.new())
+    miss = Map.get(state.signals.rules_miss, swarm, %{})
+    known_keys = MapSet.union(seen, present_keys)
+
+    {new_miss, alerts} =
+      Enum.reduce(known_keys, {%{}, []}, fn block_key, {miss_acc, alerts_acc} ->
+        if MapSet.member?(present_keys, block_key) do
+          {Map.put(miss_acc, block_key, 0), alerts_acc}
+        else
+          count = Map.get(miss, block_key, 0) + 1
+          miss_acc = Map.put(miss_acc, block_key, count)
+
+          if count >= 2 do
+            {miss_acc, [rules_gone_alert(swarm, block_key, now) | alerts_acc]}
+          else
+            {miss_acc, alerts_acc}
+          end
+        end
+      end)
+
+    state = %{
+      state
+      | signals: %{
+          state.signals
+          | rules_seen: Map.put(state.signals.rules_seen, swarm, known_keys),
+            rules_miss: Map.put(state.signals.rules_miss, swarm, new_miss)
+        }
+    }
+
+    {state, alerts}
+  end
+
+  defp rules_gone_alert(swarm, block_key, now) do
+    %{
+      type: :health_rules_gone,
+      swarm: swarm,
+      at_ms: now,
+      summary:
+        "block #{block_key} stopped publishing health_rules for 2 consecutive ticks — " <>
+          "the package removed/regressed its rules, or the component is down",
+      evidence: %{"block" => block_key},
+      key: {swarm, :health_rules_gone, block_key},
+      cids: []
+    }
+  end
+
+  # Task 6 controller addendum: bounded HERE, not inside Signals —
+  # signals.ex stays a pure grammar evaluator with no opinion on hostile
+  # block sizes. A block that reports (or lies about) an oversized "each"
+  # list must not mint unbounded alert keys/cooldown entries: cap alerts
+  # per (block, rule_id) per tick at 10 (silently drop the rest — the
+  # per-swarm alert budget downstream would coalesce any real overflow
+  # anyway) and slice a string item_key to 64 chars before it becomes part
+  # of a persisted-adjacent cooldown key.
+  defp bound_signal_alerts(alerts) do
+    alerts
+    |> Enum.map(&bound_item_key/1)
+    |> Enum.reduce({%{}, []}, fn alert, {counts, acc} ->
+      group = signal_rule_group(alert)
+      count = Map.get(counts, group, 0)
+
+      if count < @alerts_per_rule_cap do
+        {Map.put(counts, group, count + 1), [alert | acc]}
+      else
+        {counts, acc}
+      end
+    end)
+    |> elem(1)
+    |> Enum.reverse()
+  end
+
+  defp signal_rule_group(%{evidence: %{"block" => block, "rule_id" => id}}), do: {block, id}
+  defp signal_rule_group(alert), do: Map.get(alert, :type)
+
+  defp bound_item_key(%{key: {swarm, :health_rule, block_key, id, item_key}} = alert)
+       when is_binary(item_key) do
+    %{alert | key: {swarm, :health_rule, block_key, id, String.slice(item_key, 0, @item_key_max)}}
+  end
+
+  defp bound_item_key(alert), do: alert
+
+  # :signals — package-rule validation failures this tick, per block. No
+  # blocks published health_rules and no operator rules configured is a
+  # healthy no-op, same convention as :digest.
+  defp record_signals_health(state, swarm, [], now),
+    do: record_health(state, swarm, :signals, now, :ok)
+
+  defp record_signals_health(state, swarm, errors, now) do
+    record_health(
+      state,
+      swarm,
+      :signals,
+      now,
+      {:error, "invalid package rules: " <> Enum.join(Enum.sort(errors), "; ")}
+    )
+  end
 
   # ── pipeline health (O7): per-swarm, per-stage self-observability ─────────
   #
@@ -1299,5 +1612,54 @@ defmodule Genswarms.Observer.Objects.Scope do
       raise ArgumentError,
             "observer boot: default_thresholds/0 key collision across detector modules: #{details}"
     end
+  end
+
+  # ── signal_rules (Task 6): operator health_rules, fail-CLOSED ───────────
+  #
+  # Config key `signal_rules`: a flat list of rule maps, each carrying its
+  # own `"block"` key (the dashboard extension key it evaluates against)
+  # plus the v1 rule grammar (id/severity/card/each/where/when — see
+  # README "Health rules (declarative)"). Grouped by block here and
+  # validated per-group via `Signals.validate_rules/1` at boot — same
+  # trust class as `custom_detectors`: an operator explicitly wrote these,
+  # so a malformed rule is a boot error naming it, never a silently
+  # skipped rule (contrast with package-shipped rules, which are fail-SOFT
+  # — see run_signals/4). Boot-only, never re-read, NEVER x-mutable.
+  defp build_signal_rules!(entries) when is_list(entries) do
+    entries
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {entry, idx}, acc ->
+      block_key = signal_rule_entry_block!(entry, idx)
+      Map.update(acc, block_key, [entry], &(&1 ++ [entry]))
+    end)
+    |> Enum.into(%{}, fn {block_key, rules} ->
+      case Signals.validate_rules(rules) do
+        {:ok, validated} ->
+          {block_key, validated}
+
+        {:error, reason} ->
+          raise ArgumentError,
+                "signal_rules: invalid rule(s) for block #{inspect(block_key)}: #{reason}"
+      end
+    end)
+  end
+
+  defp build_signal_rules!(other) do
+    raise ArgumentError, "signal_rules: expected a list, got #{inspect(other)}"
+  end
+
+  defp signal_rule_entry_block!(entry, idx) when is_map(entry) do
+    case Map.get(entry, "block") do
+      b when is_binary(b) and b != "" ->
+        b
+
+      other ->
+        raise ArgumentError,
+              "signal_rules: entry at index #{idx} has invalid/missing \"block\" #{inspect(other)}"
+    end
+  end
+
+  defp signal_rule_entry_block!(other, idx) do
+    raise ArgumentError, "signal_rules: entry at index #{idx} is not a map (#{inspect(other)})"
   end
 end

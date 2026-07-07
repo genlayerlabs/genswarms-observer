@@ -7,6 +7,22 @@
   escalation from `:scope` as diagnosis tasks. Requires engine ≥ #79 for the
   bwrap workspace/seed fixes.
 - Repo language normalized to English.
+- Signals stage (Task 6): `Genswarms.Observer.Signals` (the v1 declarative
+  `health_rules` evaluator) is now wired into `:scope`'s tick, right after
+  `fetch` and before `DetectorRunner.run` — its alerts join the same
+  `Lifecycle.process` batch as detector/quarantine alerts. Package-shipped
+  rules (`block["health_rules"]`) are fail-soft (a malformed block is
+  dropped + named in a new `:signals` per-stage health entry, other blocks
+  still evaluate); the new `signal_rules` config (boot-only, never
+  x-mutable, grouped by `"block"`) is fail-closed like `custom_detectors`.
+  Delta samples and the sovereign `rules_gone` check (a package block
+  absent for 2 consecutive dashboard-ok ticks) are persisted under a new
+  `:signals` store payload key (`samples`/`rules_seen`/`rules_miss`),
+  validated on load. Alerts are bounded at the Scope integration layer
+  (10/rule/tick, item_key sliced to 64 chars) — `Signals` itself stays a
+  pure, unbounded-input-tolerant grammar evaluator. See README "Health
+  rules (declarative)" for the full grammar/trust/absence-tolerance
+  contract.
 
 ### Changed
 - Tick restructured into commit-together pipeline modules (`Ingest`,

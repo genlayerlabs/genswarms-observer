@@ -2,12 +2,18 @@ defmodule Genswarms.Observer.Store do
   @moduledoc """
   Injectable durability seam for `Genswarms.Observer.Objects.Scope`.
 
-  The store persists exactly three things, as plain Elixir terms:
+  The store persists these things, as plain Elixir terms:
 
   - `seen_periods` — `%{swarm => MapSet.t(String.t())}`, digest period ids
     already delivered (O4).
   - `last_alert` — `%{key => at_ms}`, cooldown timestamps per alert key.
   - `det` — `%{swarm => %{module => term}}`, opaque per-detector state.
+  - `signals` (Task 6) — `%{samples:, rules_seen:, rules_miss:}` for the
+    declarative `health_rules` evaluator: `samples` is
+    `%{{swarm, block_key, rule_id, path} => number}` (delta bookkeeping),
+    `rules_seen` is `%{swarm => MapSet.t(block_key)}` and `rules_miss` is
+    `%{swarm => %{block_key => consecutive_miss_count}}` (the sovereign
+    `rules_gone` debounce). See `Genswarms.Observer.Objects.Scope`.
 
   Deliberately Elixir terms, not JSON: `MapSet` does not round-trip through
   JSON, and re-deriving it on every load would be needless ceremony for a
@@ -29,6 +35,7 @@ defmodule Genswarms.Observer.Store do
           optional(:seen_periods) => %{String.t() => MapSet.t()},
           optional(:last_alert) => map,
           optional(:det) => map,
+          optional(:signals) => map,
           optional(:save_seq) => non_neg_integer
         }
 

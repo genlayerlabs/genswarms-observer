@@ -325,4 +325,109 @@ defmodule Genswarms.Observer.StoreTest do
     # save/1 raised, so the watermark could not advance
     assert state.save_seq == 0
   end
+
+  # ── Task 6: signals (samples / rules_seen / rules_miss) persistence ──────
+
+  @poll_conflict_rule %{
+    "id" => "poll_conflict",
+    "severity" => "warn",
+    "card" => "getUpdates 409 conflict",
+    "when" => %{"op" => "gt", "lhs" => %{"delta" => "conflict_count"}, "rhs" => 0}
+  }
+
+  defp poller_envelope(conflict_count) do
+    %{
+      "status" => "running",
+      "summary" => %{"pool" => %{"leased" => 0, "size" => 4}},
+      "nodes" => [],
+      "sessions" => [],
+      "warnings" => [],
+      "extensions" => %{
+        "telegram_poller" => %{
+          "v" => 1,
+          "conflict_count" => conflict_count,
+          "health_rules" => [@poll_conflict_rule]
+        }
+      }
+    }
+  end
+
+  defp start_signals_scope(store_mod, fixture) do
+    {:ok, fake} = Client.Fake.start_link(%{"wingston" => fixture})
+    {:ok, clock} = Agent.start_link(fn -> @t0 end)
+    {:ok, outbox} = Agent.start_link(fn -> [] end)
+
+    config = %{
+      swarm_name: "observer",
+      registry: %{
+        "wingston" => %{dashboard_url: "http://dash.example:4994", token_env: nil, repo: nil}
+      },
+      tick_sources: ["cron"],
+      read_sources: [],
+      alert_conversation_id: "tg:1:0",
+      client: Client.Fake,
+      client_opts: [fake: fake],
+      store_mod: store_mod,
+      now_fn: fn -> Agent.get(clock, & &1) end,
+      deliver_fn: fn target, from, content ->
+        Agent.update(outbox, &[%{target: target, from: from, content: content} | &1])
+        :ok
+      end
+    }
+
+    {:ok, state} = Scope.init(config)
+    %{state: state, config: config, outbox: outbox}
+  end
+
+  test "signals samples + rules_seen survive a store round-trip" do
+    {name, _pid} = fresh_store()
+
+    %{state: state, config: config} =
+      start_signals_scope(name, %{dashboard: {:ok, poller_envelope(0)}, events: {:ok, []}})
+
+    {reply1, state} = decode_reply(tick(state))
+    assert reply1["alerts"] == 0
+
+    sample_key = {"wingston", "telegram_poller", "poll_conflict", "conflict_count"}
+    assert state.signals.samples[sample_key] == 0
+    assert MapSet.member?(state.signals.rules_seen["wingston"], "telegram_poller")
+
+    # A fresh Scope session against the SAME store picks up samples and
+    # rules_seen (not just det/last_alert/seen_periods).
+    {:ok, state2} = Scope.init(config)
+    assert state2.signals.samples[sample_key] == 0
+    assert MapSet.member?(state2.signals.rules_seen["wingston"], "telegram_poller")
+  end
+
+  test "a poisoned :signals in store loads a clean default, never crashes boot or tick" do
+    {name, pid} = fresh_store()
+
+    Agent.update(pid, fn _ ->
+      {:ok,
+       %{
+         det: %{},
+         last_alert: %{},
+         seen_periods: %{},
+         signals: %{samples: "garbage", rules_seen: 42, rules_miss: [1, 2, 3]},
+         save_seq: 0
+       }}
+    end)
+
+    %{state: state} = start_scope(name)
+    assert state.signals == %{samples: %{}, rules_seen: %{}, rules_miss: %{}}
+
+    {reply, _state} = decode_reply(tick(state))
+    assert reply["ok"] == true
+  end
+
+  test "signals absent from an older store payload boots a clean default" do
+    {name, pid} = fresh_store()
+
+    Agent.update(pid, fn _ ->
+      {:ok, %{det: %{}, last_alert: %{}, seen_periods: %{}, save_seq: 0}}
+    end)
+
+    %{state: state} = start_scope(name)
+    assert state.signals == %{samples: %{}, rules_seen: %{}, rules_miss: %{}}
+  end
 end

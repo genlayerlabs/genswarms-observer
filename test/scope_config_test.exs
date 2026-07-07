@@ -237,4 +237,65 @@ defmodule Genswarms.Observer.ScopeConfigTest do
     assert Enum.any?(swarms_hit, &(&1 =~ "mm"))
     assert Enum.any?(swarms_hit, &(&1 =~ "wingston"))
   end
+
+  # ── Task 6: signal_rules — operator config, fail-CLOSED ──────────────────
+
+  test "an invalid signal_rules operator rule raises at init, naming the rule id" do
+    config =
+      base_config(%{
+        signal_rules: [
+          %{
+            "block" => "cron",
+            "id" => "Not Valid!",
+            "card" => "x",
+            "when" => %{"op" => "gt", "lhs" => "now", "rhs" => 0}
+          }
+        ]
+      })
+
+    assert_raise ArgumentError, ~r/Not Valid!/, fn -> Scope.init(config) end
+  end
+
+  test "a signal_rules entry missing its \"block\" key raises at init" do
+    config =
+      base_config(%{
+        signal_rules: [%{"id" => "x", "card" => "x", "when" => %{"op" => "gt", "lhs" => 1, "rhs" => 0}}]
+      })
+
+    assert_raise ArgumentError, ~r/"block"/, fn -> Scope.init(config) end
+  end
+
+  test "a non-list signal_rules raises at init" do
+    config = base_config(%{signal_rules: %{"block" => "cron"}})
+    assert_raise ArgumentError, ~r/signal_rules/, fn -> Scope.init(config) end
+  end
+
+  test "valid signal_rules entries boot cleanly, grouped by block" do
+    config =
+      base_config(%{
+        signal_rules: [
+          %{
+            "block" => "cron",
+            "id" => "always",
+            "card" => "x",
+            "when" => %{"op" => "gt", "lhs" => "now", "rhs" => 0}
+          },
+          %{
+            "block" => "metrics_today",
+            "id" => "other",
+            "card" => "y",
+            "when" => %{"op" => "gt", "lhs" => "now", "rhs" => 0}
+          }
+        ]
+      })
+
+    assert {:ok, state} = Scope.init(config)
+    assert %{"cron" => [%{"id" => "always"}], "metrics_today" => [%{"id" => "other"}]} =
+             state.signal_rules_by_block
+  end
+
+  test "default (empty) signal_rules boots cleanly" do
+    assert {:ok, state} = Scope.init(base_config(%{}))
+    assert state.signal_rules_by_block == %{}
+  end
 end
