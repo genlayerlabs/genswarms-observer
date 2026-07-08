@@ -57,6 +57,21 @@ defmodule Genswarms.Observer.IngestTest do
     assert proposed == 12
   end
 
+  @tag regression: "F8"
+  test "feed reset re-baselines from zero and returns the post-restart ring" do
+    fake =
+      fake_with(fn
+        5000 -> {:ok, %{events: [], seq: 37}}
+        0 -> {:ok, %{events: [%{"kind" => "request_open", "cid" => "fresh", "seq" => 37}], seq: 37}}
+        37 -> {:ok, %{events: [], seq: 37}}
+      end)
+
+    {data, proposed} = Ingest.fetch(Client.Fake, [fake: fake], "wingston", @entry, 5000, 10)
+
+    assert {:ok, [%{"cid" => "fresh"}]} = data.feed
+    assert proposed == 37
+  end
+
   test "feed error leaves the proposal nil and reports the error" do
     fake = fake_with({:error, :boom})
 
