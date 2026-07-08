@@ -216,12 +216,13 @@ defmodule Genswarms.Observer.Signals do
   @spec evaluate(String.t(), map, [rule], map, map, String.t(), integer) :: {[map], map}
   def evaluate(block_key, block, rules, extensions, samples, swarm, now_ms)
       when is_list(rules) and is_map(block) do
-    Enum.reduce(rules, {[], samples}, fn rule, {alerts_acc, samples_acc} ->
+    Enum.reduce(rules, {[], %{prev: samples, next: samples}}, fn rule, {alerts_acc, samples_acc} ->
       {alerts, new_samples} =
         safe_eval_rule(rule, block_key, block, extensions, samples_acc, swarm, now_ms)
 
       {alerts_acc ++ alerts, new_samples}
     end)
+    |> then(fn {alerts, sample_state} -> {alerts, sample_state.next} end)
   end
 
   def evaluate(_block_key, _block, _rules, _extensions, samples, _swarm, _now_ms),
@@ -411,15 +412,15 @@ defmodule Genswarms.Observer.Signals do
   end
 
   # delta is always block-relative (or extensions-relative via "../") — never
-  # item-relative, even inside an `each`. ALWAYS records the current numeric
-  # reading into samples, whether or not a prior sample existed.
-  defp eval_delta(path, block, extensions, samples, block_key, rule_id) do
+  # item-relative, even inside an `each`. It reads only the pre-tick snapshot
+  # and records the current numeric reading into the next snapshot.
+  defp eval_delta(path, block, extensions, %{prev: prev, next: next} = samples, block_key, rule_id) do
     case resolve_rooted(path, block, extensions) do
       {:ok, cur} when is_number(cur) ->
         sample_key = {block_key, rule_id, path}
-        new_samples = Map.put(samples, sample_key, cur)
+        new_samples = %{samples | next: Map.put(next, sample_key, cur)}
 
-        case Map.fetch(samples, sample_key) do
+        case Map.fetch(prev, sample_key) do
           {:ok, prev} when is_number(prev) -> {cur - prev, new_samples}
           _ -> {@absent, new_samples}
         end

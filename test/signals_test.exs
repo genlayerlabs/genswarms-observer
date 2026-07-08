@@ -391,6 +391,24 @@ defmodule Genswarms.Observer.SignalsTest do
 
       assert alerts3 == []
     end
+
+    @tag regression: "F9"
+    test "the same delta in where and when reads the pre-tick sample both times" do
+      rule = %{
+        "id" => "same_delta_twice",
+        "card" => "delta jumped",
+        "where" => %{"op" => "gt", "lhs" => %{"delta" => "conflict_count"}, "rhs" => 0},
+        "when" => %{"op" => "gt", "lhs" => %{"delta" => "conflict_count"}, "rhs" => 0}
+      }
+
+      samples = %{{"telegram_poller", "same_delta_twice", "conflict_count"} => 1}
+
+      {alerts, new_samples} =
+        Signals.evaluate("telegram_poller", %{"conflict_count" => 3}, [rule], %{}, samples, "w", 0)
+
+      assert [_] = alerts
+      assert new_samples == %{{"telegram_poller", "same_delta_twice", "conflict_count"} => 3}
+    end
   end
 
   describe "evaluate/7 — \"../\" host-trust escape (metrics_health fixture)" do
@@ -420,6 +438,35 @@ defmodule Genswarms.Observer.SignalsTest do
         )
 
       assert [_] = alerts2
+    end
+
+    @tag regression: "F9"
+    test "each items all see the same pre-tick block-level delta via ../" do
+      rule = %{
+        "id" => "fanout",
+        "card" => "item {name} saw rejected metrics",
+        "each" => "items",
+        "when" => %{
+          "op" => "gt",
+          "lhs" => %{"delta" => "../metrics_today.metrics_rejected"},
+          "rhs" => 0
+        }
+      }
+
+      block = %{"items" => [%{"name" => "a"}, %{"name" => "b"}, %{"name" => "c"}]}
+      extensions = %{"metrics_today" => %{"metrics_rejected" => 5}}
+      samples = %{{"metrics_health", "fanout", "../metrics_today.metrics_rejected"} => 1}
+
+      {alerts, new_samples} =
+        Signals.evaluate("metrics_health", block, [rule], extensions, samples, "w", 0)
+
+      assert Enum.map(alerts, & &1.summary) == [
+               "item a saw rejected metrics",
+               "item b saw rejected metrics",
+               "item c saw rejected metrics"
+             ]
+
+      assert new_samples == %{{"metrics_health", "fanout", "../metrics_today.metrics_rejected"} => 5}
     end
   end
 
