@@ -185,8 +185,8 @@ defmodule Genswarms.Observer.Objects.Scope do
       now_fn: now_fn,
       deliver_fn: cfg(config, :deliver_fn, default_deliver_fn(swarm_name)),
       store_mod:
-        module_ref(
-          cfg(config, :store_mod, Genswarms.Observer.Store.InMemory),
+        store_module_ref!(
+          cfg(config, :store_mod, nil),
           Genswarms.Observer.Store.InMemory
         ),
       detectors: @builtin_detectors,
@@ -1488,6 +1488,25 @@ defmodule Genswarms.Observer.Objects.Scope do
     String.to_existing_atom("Elixir." <> String.trim_leading(name, "Elixir."))
   rescue
     ArgumentError -> default
+  end
+
+  defp store_module_ref!(nil, default), do: default
+  defp store_module_ref!("", default), do: default
+  defp store_module_ref!(mod, _default) when is_atom(mod), do: mod
+
+  defp store_module_ref!(name, _default) when is_binary(name) do
+    mod =
+      name
+      |> String.trim()
+      |> String.trim_leading("Elixir.")
+      |> String.split(".")
+      |> Module.concat()
+
+    if Code.ensure_loaded?(mod) do
+      mod
+    else
+      raise ArgumentError, "store_mod #{name} could not be resolved to a loaded module"
+    end
   end
 
   # ── custom detectors (O5) ────────────────────────────────────────────────

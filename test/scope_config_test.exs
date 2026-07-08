@@ -298,4 +298,21 @@ defmodule Genswarms.Observer.ScopeConfigTest do
     assert {:ok, state} = Scope.init(base_config(%{}))
     assert state.signal_rules_by_block == %{}
   end
+
+  @tag regression: "F13"
+  test "an explicitly configured bogus store_mod string raises at init" do
+    config = base_config(%{store_mod: "Genswarms.Observer.Store.DoesNotExist"})
+
+    assert_raise ArgumentError, ~r/store_mod.*Genswarms\.Observer\.Store\.DoesNotExist/, fn ->
+      Scope.init(config)
+    end
+  end
+
+  @tag regression: "F13"
+  test "a real store module resolves when configured as a string" do
+    config = base_config(%{store_mod: "Genswarms.Observer.Store.InMemory"})
+
+    assert {:ok, state} = Scope.init(config)
+    assert state.store_mod == Genswarms.Observer.Store.InMemory
+  end
 end
