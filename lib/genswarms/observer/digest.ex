@@ -50,6 +50,8 @@ defmodule Genswarms.Observer.Digest do
 
   @period_re ~r/^\d{4}-\d{2}-\d{2}$/
   @label_cap 80
+  @entry_cap 12
+  @card_text_cap 3500
 
   # Order matters (lesson from the host-side review): strip
   # control/bidi/zero-width/format chars BEFORE scrubbing structured PII.
@@ -227,7 +229,7 @@ defmodule Genswarms.Observer.Digest do
         full_blocks(coverage, period)
       end
 
-    %{"title" => title, "blocks" => blocks}
+    guard_card(%{"title" => title, "blocks" => blocks})
   end
 
   defp full_blocks(coverage, period) do
@@ -260,7 +262,7 @@ defmodule Genswarms.Observer.Digest do
   defp topics_block(topics) when is_list(topics) do
     case topics |> Enum.map(&topic_line/1) |> Enum.reject(&is_nil/1) do
       [] -> []
-      lines -> [%{"kind" => "paragraph", "text" => Enum.join(lines, "\n")}]
+      lines -> [%{"kind" => "paragraph", "text" => capped_lines(lines) |> Enum.join("\n")}]
     end
   end
 
@@ -278,7 +280,7 @@ defmodule Genswarms.Observer.Digest do
   defp signals_block(signals) when is_list(signals) do
     case signals |> Enum.map(&signal_part/1) |> Enum.reject(&is_nil/1) do
       [] -> []
-      parts -> [%{"kind" => "paragraph", "text" => "signals: " <> Enum.join(parts, ", ")}]
+      parts -> [%{"kind" => "paragraph", "text" => "signals: " <> Enum.join(capped_lines(parts), ", ")}]
     end
   end
 
@@ -307,7 +309,7 @@ defmodule Genswarms.Observer.Digest do
     total_conversations = sum_counts(older, "conversations")
     total_turns = sum_counts(older, "turns")
 
-    %{
+    guard_card(%{
       "title" => "📊 digest: #{swarm} · missed #{n} periods",
       "blocks" => [
         %{"kind" => "paragraph", "text" => range_text},
@@ -317,7 +319,49 @@ defmodule Genswarms.Observer.Digest do
         },
         %{"kind" => "paragraph", "text" => "details in each period's row on the dashboard"}
       ]
-    }
+    })
+  end
+
+  defp capped_lines(lines) do
+    {kept, dropped} = Enum.split(lines, @entry_cap)
+
+    if dropped == [] do
+      kept
+    else
+      kept ++ ["… +#{length(dropped)} more"]
+    end
+  end
+
+  defp guard_card(%{"title" => title, "blocks" => blocks} = card) do
+    text = Enum.join([title | Enum.map(blocks, & &1["text"])], "\n")
+
+    if String.length(text) <= @card_text_cap do
+      card
+    else
+      marker = "… [truncated]"
+      budget = max(@card_text_cap - String.length(title) - String.length(marker) - 2, 0)
+
+      body =
+        blocks
+        |> Enum.flat_map(fn block -> block["text"] |> to_string() |> String.split("\n") end)
+        |> take_lines(budget, [])
+        |> Enum.join("\n")
+
+      %{card | "blocks" => [%{"kind" => "paragraph", "text" => body <> "\n" <> marker}]}
+    end
+  end
+
+  defp take_lines([], _budget, acc), do: Enum.reverse(acc)
+
+  defp take_lines([line | rest], budget, acc) do
+    used = acc |> Enum.reverse() |> Enum.join("\n") |> String.length()
+    next_used = used + if(acc == [], do: 0, else: 1) + String.length(line)
+
+    if next_used <= budget do
+      take_lines(rest, budget, [line | acc])
+    else
+      Enum.reverse(acc)
+    end
   end
 
   defp sum_counts(periods, key) do

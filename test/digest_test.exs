@@ -30,6 +30,7 @@ defmodule Genswarms.Observer.DigestTest do
   end
 
   defp texts(card), do: Enum.map(card["blocks"], & &1["text"])
+  defp card_text(card), do: Enum.join([card["title"] | texts(card)], "\n")
 
   # plan/3 takes the trusted swarm name explicitly — tests default it to
   # "wingston" to match envelope/2's default "swarm" field, except where a
@@ -283,6 +284,32 @@ defmodule Genswarms.Observer.DigestTest do
     {[full], _} = plan(env, MapSet.new())
     assert texts(full) |> Enum.any?(&(&1 =~ "• ok one (1)"))
     assert texts(full) |> Enum.any?(&(&1 == "signals: confusion (1)"))
+  end
+
+  @tag regression: "F12"
+  test "topics are entry-capped with a remainder line and the card stays deliverable" do
+    topics = for i <- 1..300, do: %{"label" => "topic #{i}", "count" => i}
+    env = envelope([period("2026-07-01", topics: topics)])
+
+    {[full], _} = plan(env, MapSet.new())
+    topics_text = texts(full) |> Enum.find(&(&1 =~ "• topic"))
+
+    assert topics_text |> String.split("\n") |> length() == 13
+    assert topics_text =~ "… +288 more"
+    assert String.length(card_text(full)) < 3500
+  end
+
+  @tag regression: "F12"
+  test "adversarially giant rendered text is truncated at the final card guard" do
+    huge_count = String.to_integer(String.duplicate("9", 400))
+    topics = for i <- 1..12, do: %{"label" => "topic #{i}", "count" => huge_count}
+    signals = for i <- 1..12, do: %{"kind" => "signal #{i}", "count" => huge_count}
+    env = envelope([period("2026-07-01", topics: topics, signals: signals)])
+
+    {[full], _} = plan(env, MapSet.new())
+
+    assert String.length(card_text(full)) <= 3500
+    assert card_text(full) =~ "… [truncated]"
   end
 
   # ── adversarial labels ────────────────────────────────────────────────────
