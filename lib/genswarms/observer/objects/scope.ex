@@ -1662,8 +1662,14 @@ defmodule Genswarms.Observer.Objects.Scope do
   # so a malformed rule is a boot error naming it, never a silently
   # skipped rule (contrast with package-shipped rules, which are fail-SOFT
   # — see run_signals/4). Boot-only, never re-read, NEVER x-mutable.
+  #
+  # Entries are deep-stringified first: the engine's seed-config
+  # normalization atomizes JSON map keys before they reach init/1, so an
+  # operator's rules arrive atom-keyed even when written as valid JSON —
+  # without this, fail-closed rejects every rule at boot.
   defp build_signal_rules!(entries) when is_list(entries) do
     entries
+    |> Enum.map(&stringify_rule_keys/1)
     |> Enum.with_index()
     |> Enum.reduce(%{}, fn {entry, idx}, acc ->
       block_key = signal_rule_entry_block!(entry, idx)
@@ -1699,4 +1705,14 @@ defmodule Genswarms.Observer.Objects.Scope do
   defp signal_rule_entry_block!(other, idx) do
     raise ArgumentError, "signal_rules: entry at index #{idx} is not a map (#{inspect(other)})"
   end
+
+  defp stringify_rule_keys(%{} = map) do
+    Enum.into(map, %{}, fn {k, v} -> {stringify_rule_key(k), stringify_rule_keys(v)} end)
+  end
+
+  defp stringify_rule_keys(list) when is_list(list), do: Enum.map(list, &stringify_rule_keys/1)
+  defp stringify_rule_keys(other), do: other
+
+  defp stringify_rule_key(k) when is_atom(k), do: Atom.to_string(k)
+  defp stringify_rule_key(k), do: k
 end

@@ -299,6 +299,29 @@ defmodule Genswarms.Observer.ScopeConfigTest do
     assert state.signal_rules_by_block == %{}
   end
 
+  @tag regression: "atom-keyed-signal-rules"
+  test "atom-keyed signal_rules entries (engine seed normalization) boot cleanly" do
+    # The engine atomizes JSON map keys before init/1 sees the config, so
+    # rules written as valid JSON arrive in this shape. Seen live
+    # 2026-07-08: fail-closed rejected every rule and scope crash-looped.
+    config =
+      base_config(%{
+        signal_rules: [
+          %{
+            block: "inbox_queue",
+            id: "inbox_backlog_deep",
+            severity: "warn",
+            card: "queue deep",
+            when: %{op: "gt", lhs: %{path: "depth"}, rhs: 50}
+          }
+        ]
+      })
+
+    assert {:ok, state} = Scope.init(config)
+    assert %{"inbox_queue" => [%{"id" => "inbox_backlog_deep"} = rule]} = state.signal_rules_by_block
+    assert %{"op" => "gt", "lhs" => %{"path" => "depth"}, "rhs" => 50} = rule["when"]
+  end
+
   @tag regression: "F13"
   test "an explicitly configured bogus store_mod string raises at init" do
     config = base_config(%{store_mod: "Genswarms.Observer.Store.DoesNotExist"})
