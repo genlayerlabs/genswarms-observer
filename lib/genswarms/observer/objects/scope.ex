@@ -637,7 +637,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         %{emit: budgeted, suppressed: tick_suppressed, last_alert: new_last_alert} =
           Lifecycle.process(
-            quarantine_alerts ++ signal_alerts ++ alerts,
+            quarantine_alerts ++ alerts ++ signal_alerts,
             st.last_alert,
             st.cooldown_minutes * 60_000,
             @alert_budget_per_swarm,
