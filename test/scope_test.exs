@@ -536,6 +536,58 @@ defmodule Genswarms.Observer.ScopeTest do
     assert evidence_text =~ "synthetic_8"
   end
 
+  @tag regression: "F10"
+  test "detector alerts survive the budget ahead of noisy signal-rule alerts" do
+    defmodule CoreDetector do
+      @behaviour Genswarms.Observer.Detector
+
+      def detect(_fetched, ctx) do
+        alert = %{
+          type: :unanswered,
+          key: {ctx.swarm, :unanswered, "cid-core"},
+          swarm: ctx.swarm,
+          at_ms: ctx.now_ms,
+          summary: "core detector alert",
+          evidence: %{},
+          cids: ["cid-core"]
+        }
+
+        {[alert], ctx.state}
+      end
+    end
+
+    dashboard =
+      healthy_dashboard()
+      |> Map.put("extensions", %{
+        "rules" => %{
+          "items" => for(i <- 1..10, do: %{"name" => "item#{i}"}),
+          "health_rules" => [
+            %{
+              "id" => "noisy",
+              "card" => "noisy {name}",
+              "each" => "items",
+              "when" => %{"op" => "eq", "lhs" => 1, "rhs" => 1}
+            }
+          ]
+        }
+      })
+
+    %{state: state, outbox: outbox} =
+      start_scope(fixture: %{"wingston" => %{healthy_fixture() | dashboard: {:ok, dashboard}}})
+
+    state = %{state | detectors: [CoreDetector]}
+    {reply, _state} = decode_reply(tick(state))
+
+    assert reply["alerts"] == 7
+
+    titles =
+      outbox
+      |> sent()
+      |> Enum.map(&Jason.decode!(&1.content)["card"]["title"])
+
+    assert Enum.any?(titles, &(&1 =~ "unanswered"))
+  end
+
   test "sustained overflow: the coalesced summary respects its own cooldown across ticks" do
     defmodule FloodDetector do
       @behaviour Genswarms.Observer.Detector
@@ -644,6 +696,66 @@ defmodule Genswarms.Observer.ScopeTest do
     assert reply["suppressed"] == 1
     # one card + one escalation from the FIRST tick only
     assert length(sent(outbox)) == 2
+  end
+
+  @tag regression: "F11"
+  test "escalation is dampened per swarm and type while cards keep per-key cooldown" do
+    defmodule FreshCidBurstDetector do
+      @behaviour Genswarms.Observer.Detector
+
+      def detect(_fetched, ctx) do
+        tick_n = ctx.state || 0
+
+        unanswered =
+          for i <- 1..3 do
+            %{
+              type: :unanswered,
+              key: {ctx.swarm, :unanswered, tick_n, i},
+              swarm: ctx.swarm,
+              at_ms: ctx.now_ms,
+              summary: "unanswered #{tick_n}/#{i}",
+              evidence: %{},
+              cids: ["cid-#{tick_n}-#{i}"]
+            }
+          end
+
+        other = %{
+          type: :error_burst,
+          key: {ctx.swarm, :error_burst, tick_n},
+          swarm: ctx.swarm,
+          at_ms: ctx.now_ms,
+          summary: "different type #{tick_n}",
+          evidence: %{},
+          cids: []
+        }
+
+        {unanswered ++ [other], tick_n + 1}
+      end
+    end
+
+    %{state: state, outbox: outbox, clock: clock} =
+      start_scope(config: %{escalate_to: :diagnostico})
+
+    state = %{state | detectors: [FreshCidBurstDetector]}
+
+    {_, state} = decode_reply(tick(state))
+    advance(clock, 5 * 60_000)
+    {_, state} = decode_reply(tick(state))
+
+    deliveries = sent(outbox)
+    cards = Enum.count(deliveries, &(&1.target == :sender))
+    escalations = Enum.filter(deliveries, &(&1.target == :diagnostico))
+
+    assert cards == 8
+    assert length(escalations) == 2
+    assert Enum.count(escalations, &(&1.content =~ "type: unanswered")) == 1
+    assert Enum.count(escalations, &(&1.content =~ "type: error_burst")) == 1
+
+    advance(clock, 31 * 60_000)
+    {_, _state} = decode_reply(tick(state))
+
+    escalations = sent(outbox) |> Enum.filter(&(&1.target == :diagnostico))
+    assert Enum.count(escalations, &(&1.content =~ "type: unanswered")) == 2
   end
 
   test "without escalate_to nothing is escalated (default off)" do

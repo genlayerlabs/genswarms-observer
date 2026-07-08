@@ -185,8 +185,8 @@ defmodule Genswarms.Observer.Objects.Scope do
       now_fn: now_fn,
       deliver_fn: cfg(config, :deliver_fn, default_deliver_fn(swarm_name)),
       store_mod:
-        module_ref(
-          cfg(config, :store_mod, Genswarms.Observer.Store.InMemory),
+        store_module_ref!(
+          cfg(config, :store_mod, nil),
           Genswarms.Observer.Store.InMemory
         ),
       detectors: @builtin_detectors,
@@ -637,7 +637,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         %{emit: budgeted, suppressed: tick_suppressed, last_alert: new_last_alert} =
           Lifecycle.process(
-            quarantine_alerts ++ signal_alerts ++ alerts,
+            quarantine_alerts ++ alerts ++ signal_alerts,
             st.last_alert,
             st.cooldown_minutes * 60_000,
             @alert_budget_per_swarm,
@@ -1204,7 +1204,7 @@ defmodule Genswarms.Observer.Objects.Scope do
         Outbox.alert_card(alert, entry)
       )
 
-    Outbox.escalate(state.deliver_fn, state.escalate_to, state.name, alert)
+    state = maybe_escalate(state, alert, now)
 
     state = record_sender_result(state, alert.swarm, result, now)
 
@@ -1230,6 +1230,24 @@ defmodule Genswarms.Observer.Objects.Scope do
           |> Map.take(Enum.map(alerts, &alert_key/1))
     }
   end
+
+  defp maybe_escalate(%{escalate_to: nil} = state, _alert, _now), do: state
+
+  defp maybe_escalate(state, alert, now) do
+    key = escalation_key(alert)
+    cooldown_ms = state.cooldown_minutes * 60_000
+
+    case Map.get(state.last_alert, key) do
+      last_ms when is_integer(last_ms) and now - last_ms < cooldown_ms ->
+        state
+
+      _ ->
+        Outbox.escalate(state.deliver_fn, state.escalate_to, state.name, alert)
+        %{state | last_alert: Map.put(state.last_alert, key, now)}
+    end
+  end
+
+  defp escalation_key(alert), do: {:escalation, alert.swarm, alert.type}
 
   # ── agent-facing reads ────────────────────────────────────────────────────
 
@@ -1470,6 +1488,25 @@ defmodule Genswarms.Observer.Objects.Scope do
     String.to_existing_atom("Elixir." <> String.trim_leading(name, "Elixir."))
   rescue
     ArgumentError -> default
+  end
+
+  defp store_module_ref!(nil, default), do: default
+  defp store_module_ref!("", default), do: default
+  defp store_module_ref!(mod, _default) when is_atom(mod), do: mod
+
+  defp store_module_ref!(name, _default) when is_binary(name) do
+    mod =
+      name
+      |> String.trim()
+      |> String.trim_leading("Elixir.")
+      |> String.split(".")
+      |> Module.concat()
+
+    if Code.ensure_loaded?(mod) do
+      mod
+    else
+      raise ArgumentError, "store_mod #{name} could not be resolved to a loaded module"
+    end
   end
 
   # ── custom detectors (O5) ────────────────────────────────────────────────

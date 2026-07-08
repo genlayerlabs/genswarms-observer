@@ -42,8 +42,14 @@ defmodule Genswarms.Observer.Ingest do
     case safe_call(client, :get_events_feed, [base, swarm, since, token, opts]) do
       {:ok, %{events: events, seq: seq}} when is_list(events) and is_integer(seq) and seq >= 0 ->
         cond do
-          events == [] or seq <= since ->
+          seq < since ->
+            drain_feed(client, opts, swarm, base, token, 0, [], max(pages_left - 1, 1))
+
+          events == [] ->
             {{:ok, acc}, seq}
+
+          seq <= since ->
+            {{:ok, acc ++ events}, seq}
 
           pages_left <= 1 ->
             {{:ok, acc ++ events}, seq}
