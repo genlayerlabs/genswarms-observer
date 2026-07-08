@@ -47,9 +47,12 @@ defmodule Genswarms.Observer.OutboxTest do
       |> Enum.flat_map(fn path ->
         source = File.read!(path)
 
+        # \s* after the paren: the formatter breaks longer calls across lines
+        # (alert(\n  :error_burst, ...) in detectors.ex) — a type minted that
+        # way must not escape this scan.
         Regex.scan(~r/type:\s*:([a-zA-Z0-9_]+)/, source, capture: :all_but_first) ++
-          Regex.scan(~r/alert\(:([a-zA-Z0-9_]+)/, source, capture: :all_but_first) ++
-          Regex.scan(~r/synthetic\(:([a-zA-Z0-9_]+)/, source, capture: :all_but_first)
+          Regex.scan(~r/alert\(\s*:([a-zA-Z0-9_]+)/, source, capture: :all_but_first) ++
+          Regex.scan(~r/synthetic\(\s*:([a-zA-Z0-9_]+)/, source, capture: :all_but_first)
       end)
       |> List.flatten()
       |> Enum.map(&String.to_atom/1)
