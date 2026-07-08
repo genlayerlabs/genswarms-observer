@@ -1204,7 +1204,7 @@ defmodule Genswarms.Observer.Objects.Scope do
         Outbox.alert_card(alert, entry)
       )
 
-    Outbox.escalate(state.deliver_fn, state.escalate_to, state.name, alert)
+    state = maybe_escalate(state, alert, now)
 
     state = record_sender_result(state, alert.swarm, result, now)
 
@@ -1230,6 +1230,24 @@ defmodule Genswarms.Observer.Objects.Scope do
           |> Map.take(Enum.map(alerts, &alert_key/1))
     }
   end
+
+  defp maybe_escalate(%{escalate_to: nil} = state, _alert, _now), do: state
+
+  defp maybe_escalate(state, alert, now) do
+    key = escalation_key(alert)
+    cooldown_ms = state.cooldown_minutes * 60_000
+
+    case Map.get(state.last_alert, key) do
+      last_ms when is_integer(last_ms) and now - last_ms < cooldown_ms ->
+        state
+
+      _ ->
+        Outbox.escalate(state.deliver_fn, state.escalate_to, state.name, alert)
+        %{state | last_alert: Map.put(state.last_alert, key, now)}
+    end
+  end
+
+  defp escalation_key(alert), do: {:escalation, alert.swarm, alert.type}
 
   # ── agent-facing reads ────────────────────────────────────────────────────
 

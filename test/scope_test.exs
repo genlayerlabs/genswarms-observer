@@ -698,6 +698,66 @@ defmodule Genswarms.Observer.ScopeTest do
     assert length(sent(outbox)) == 2
   end
 
+  @tag regression: "F11"
+  test "escalation is dampened per swarm and type while cards keep per-key cooldown" do
+    defmodule FreshCidBurstDetector do
+      @behaviour Genswarms.Observer.Detector
+
+      def detect(_fetched, ctx) do
+        tick_n = ctx.state || 0
+
+        unanswered =
+          for i <- 1..3 do
+            %{
+              type: :unanswered,
+              key: {ctx.swarm, :unanswered, tick_n, i},
+              swarm: ctx.swarm,
+              at_ms: ctx.now_ms,
+              summary: "unanswered #{tick_n}/#{i}",
+              evidence: %{},
+              cids: ["cid-#{tick_n}-#{i}"]
+            }
+          end
+
+        other = %{
+          type: :error_burst,
+          key: {ctx.swarm, :error_burst, tick_n},
+          swarm: ctx.swarm,
+          at_ms: ctx.now_ms,
+          summary: "different type #{tick_n}",
+          evidence: %{},
+          cids: []
+        }
+
+        {unanswered ++ [other], tick_n + 1}
+      end
+    end
+
+    %{state: state, outbox: outbox, clock: clock} =
+      start_scope(config: %{escalate_to: :diagnostico})
+
+    state = %{state | detectors: [FreshCidBurstDetector]}
+
+    {_, state} = decode_reply(tick(state))
+    advance(clock, 5 * 60_000)
+    {_, state} = decode_reply(tick(state))
+
+    deliveries = sent(outbox)
+    cards = Enum.count(deliveries, &(&1.target == :sender))
+    escalations = Enum.filter(deliveries, &(&1.target == :diagnostico))
+
+    assert cards == 8
+    assert length(escalations) == 2
+    assert Enum.count(escalations, &(&1.content =~ "type: unanswered")) == 1
+    assert Enum.count(escalations, &(&1.content =~ "type: error_burst")) == 1
+
+    advance(clock, 31 * 60_000)
+    {_, _state} = decode_reply(tick(state))
+
+    escalations = sent(outbox) |> Enum.filter(&(&1.target == :diagnostico))
+    assert Enum.count(escalations, &(&1.content =~ "type: unanswered")) == 2
+  end
+
   test "without escalate_to nothing is escalated (default off)" do
     %{state: state, outbox: outbox} =
       start_scope(fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}})
