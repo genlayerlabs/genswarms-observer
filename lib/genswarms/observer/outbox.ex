@@ -30,38 +30,140 @@ defmodule Genswarms.Observer.Outbox do
     end
   end
 
-  def alert_card(alert, entry) do
-    dashboard_link = "#{entry["dashboard_url"]}/api/swarms/#{alert.swarm}/dashboard"
+  # 2026-07-09 redesign ("his notifications are total crap"): a card is a plain
+  # sentence a human parses at a glance — never raw JSON, never internal URLs.
+  # Per-type titles; evidence decoded into the body for the common types and
+  # compacted to "k v" lines otherwise; the machine tail (swarm · type · cid)
+  # survives only on alerts worth investigating, so a restart blip reads quiet
+  # while a waiting user carries everything Claude needs to dig in.
+  # `recent` (the emitter's kept-alerts list) powers correlation: an unanswered
+  # request minutes after an endpoint_down says "restart", not just "no reply".
+  @recent_restart_window_ms 15 * 60_000
+  @investigable ~w(unanswered error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback)a
 
-    repo_line =
-      case entry["repo"] do
-        repo when is_binary(repo) and repo != "" -> "\nrepo: https://github.com/#{repo}"
+  def alert_card(alert, entry, recent \\ [])
+
+  def alert_card(alert, _entry, recent) do
+    custom = body_for(alert, recent)
+
+    blocks =
+      [%{"kind" => "paragraph", "text" => custom || alert.summary}] ++
+        evidence_block(alert, custom) ++
+        explain_block(alert, custom) ++
+        tail_block(alert)
+
+    %{"title" => title_for(alert), "blocks" => blocks}
+  end
+
+  defp title_for(%{type: :unanswered, swarm: swarm} = alert) do
+    waited = Map.get(alert.evidence || %{}, "waited_minutes")
+    mins = if is_integer(waited), do: " #{waited} min", else: ""
+    "🕐 #{swarm}: a user has been waiting#{mins} with no reply"
+  end
+
+  defp title_for(%{type: :endpoint_down, swarm: swarm} = alert) do
+    if restart_shaped?(alert),
+      do: "🔄 #{swarm}: unreachable — likely a restart/deploy",
+      else: "🔌 #{swarm}: dashboard unreachable"
+  end
+
+  defp title_for(%{type: :budget_block, swarm: swarm}), do: "💸 #{swarm}: LLM budget block"
+  defp title_for(%{type: :error_burst, swarm: swarm}), do: "🔥 #{swarm}: error burst"
+
+  defp title_for(%{type: :reply_failed_burst, swarm: swarm}),
+    do: "📵 #{swarm}: replies are failing"
+
+  defp title_for(%{type: :pool_saturated, swarm: swarm}), do: "🧯 #{swarm}: agent pool saturated"
+  defp title_for(%{type: :stall, swarm: swarm}), do: "🧊 #{swarm}: active work but no progress"
+  defp title_for(alert), do: "⚠️ observer: #{alert.swarm} · #{alert.type}"
+
+  # Custom human bodies — nil falls back to alert.summary + the 💡 explanation.
+  defp body_for(%{type: :unanswered} = alert, recent) do
+    waited = Map.get(alert.evidence || %{}, "waited_minutes")
+    mins = if is_integer(waited), do: "#{waited} min", else: "a while"
+
+    restart =
+      Enum.find(recent, fn r ->
+        r.type == :endpoint_down and r.swarm == alert.swarm and
+          alert.at_ms - r.at_ms in 0..@recent_restart_window_ms
+      end)
+
+    base = "They wrote and no agent has answered for #{mins}."
+
+    if restart do
+      base <>
+        " A restart was seen just before — their reply likely died with the old pod. Their next message gets a fresh agent."
+    else
+      base <> " Their next message gets a fresh agent, or paste this to Claude to dig in."
+    end
+  end
+
+  defp body_for(%{type: :endpoint_down} = alert, _recent) do
+    if restart_shaped?(alert) do
+      "The fleet API doesn't know the swarm right now — almost always a deploy rolling out or the pod rebooting. If no deploy was expected, treat this as real and check the pod."
+    end
+  end
+
+  defp body_for(_alert, _recent), do: nil
+
+  defp restart_shaped?(alert),
+    do: String.contains?(to_string(alert.summary), "swarm_not_found")
+
+  # Compact "k v" evidence for types WITHOUT a custom body (which already
+  # decoded it). Never raw JSON.
+  defp evidence_block(_alert, custom) when is_binary(custom), do: []
+
+  defp evidence_block(%{evidence: ev}, _custom) when is_map(ev) and map_size(ev) > 0 do
+    line = Enum.map_join(ev, " · ", fn {k, v} -> "#{k} #{compact_value(v)}" end)
+    [%{"kind" => "paragraph", "text" => line}]
+  end
+
+  defp evidence_block(_alert, _custom), do: []
+
+  defp compact_value(v) when is_binary(v), do: String.slice(v, 0, 120)
+  defp compact_value(v) when is_number(v) or is_boolean(v) or is_atom(v), do: to_string(v)
+
+  # a map value (e.g. alerts_coalesced's dropped-type counts) lists its entries —
+  # a truncated inspect() ate the very counts the card exists to show
+  defp compact_value(v) when is_map(v),
+    do: Enum.map_join(v, ", ", fn {k, n} -> "#{k} #{compact_value(n)}" end)
+
+  defp compact_value(v), do: v |> inspect() |> String.slice(0, 400)
+
+  defp explain_block(_alert, custom) when is_binary(custom), do: []
+
+  defp explain_block(alert, _custom) do
+    case explain(alert.type) do
+      nil -> []
+      text -> [%{"kind" => "paragraph", "text" => "💡 #{text}"}]
+    end
+  end
+
+  # a real fetch failure (refused/timeout) is worth investigating; only the
+  # restart-shaped "swarm_not_found" blip stays quiet
+  defp tail_block(%{type: :endpoint_down} = alert) do
+    if restart_shaped?(alert), do: [], else: investigate_tail(alert)
+  end
+
+  defp tail_block(%{type: type} = alert) when type in @investigable do
+    investigate_tail(alert)
+  end
+
+  defp tail_block(_alert), do: []
+
+  defp investigate_tail(alert) do
+    cid =
+      case alert.cids do
+        [cid | _] -> " · #{cid}"
         _ -> ""
       end
 
-    blocks =
-      [
-        %{"kind" => "paragraph", "text" => alert.summary},
-        %{"kind" => "paragraph", "text" => "evidence: #{Jason.encode!(alert.evidence)}"},
-        %{"kind" => "paragraph", "text" => "dashboard: #{dashboard_link}#{repo_line}"},
-        %{
-          "kind" => "paragraph",
-          "text" =>
-              "investigate: connect the genswarms-fleet MCP and run " <>
-              ~s{get_events("#{alert.swarm}", level: "error") and get_dashboard("#{alert.swarm}").}
-        }
-      ]
-
-    blocks =
-      case explain(alert.type) do
-        nil -> blocks
-        text -> blocks ++ [%{"kind" => "paragraph", "text" => "💡 #{text}"}]
-      end
-
-    %{
-      "title" => "⚠️ observer: #{alert.swarm} · #{alert.type}",
-      "blocks" => blocks
-    }
+    [
+      %{
+        "kind" => "paragraph",
+        "text" => "↳ #{alert.swarm} · #{alert.type}#{cid} — paste to Claude to investigate"
+      }
+    ]
   end
 
   def explain(:alerts_coalesced), do: "Too many alerts fired in one tick; inspect the evidence counts for dropped alert types."

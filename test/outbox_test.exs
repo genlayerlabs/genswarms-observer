@@ -22,6 +22,103 @@ defmodule Genswarms.Observer.OutboxTest do
     assert {:error, :down} = Outbox.send_card(deliver, :sender, :scope, "tg:42:0", %{})
   end
 
+  # ── human-readable cards (2026-07-09 redesign: "his notifications are total crap") ──
+
+  defp card_text(card), do: card["blocks"] |> Enum.map(& &1["text"]) |> Enum.join("\n")
+
+  test "unanswered renders a human sentence, no raw JSON, with an investigate tail" do
+    alert = %{
+      type: :unanswered,
+      swarm: "wingston-prod",
+      at_ms: 1_783_611_350_377,
+      summary: "request tg:7790150175:0 unanswered for 16 min",
+      evidence: %{"opened_at_ms" => 1_783_611_350_377, "waited_minutes" => 16},
+      cids: ["tg:7790150175:0"]
+    }
+
+    card = Outbox.alert_card(alert, %{"dashboard_url" => "http://internal-elb", "repo" => "x/y"})
+    text = card_text(card)
+
+    assert card["title"] =~ "waiting"
+    assert text =~ "16 min"
+    # decoded, not dumped: no JSON braces/escapes, no internal URLs
+    refute text =~ "{\""
+    refute text =~ "internal-elb"
+    refute text =~ "evidence:"
+    # the machine tail keeps what Claude needs to investigate
+    assert text =~ "tg:7790150175:0"
+    assert text =~ "wingston-prod"
+  end
+
+  test "an unanswered alert right after a restart says so (correlation)" do
+    restart = %{
+      type: :endpoint_down,
+      swarm: "wingston-prod",
+      at_ms: 1_000_000,
+      summary: ~s(dashboard fetch failed: {:http_status, 404, "{\"error\":\"swarm_not_found\"}"}),
+      evidence: %{"reason" => "..."},
+      cids: []
+    }
+
+    alert = %{
+      type: :unanswered,
+      swarm: "wingston-prod",
+      at_ms: 1_000_000 + 5 * 60_000,
+      summary: "request tg:1:0 unanswered for 15 min",
+      evidence: %{"waited_minutes" => 15},
+      cids: ["tg:1:0"]
+    }
+
+    card = Outbox.alert_card(alert, %{}, [restart])
+    assert card_text(card) =~ "restart"
+
+    # ...but not when the restart was long ago or another swarm
+    old_restart = %{restart | at_ms: alert.at_ms - 60 * 60_000}
+    refute Outbox.alert_card(alert, %{}, [old_restart]) |> card_text() =~ "restart"
+
+    other_swarm = %{restart | swarm: "elsewhere"}
+    refute Outbox.alert_card(alert, %{}, [other_swarm]) |> card_text() =~ "restart"
+  end
+
+  test "endpoint_down swarm_not_found reads as a deploy/restart blip without an investigate tail" do
+    alert = %{
+      type: :endpoint_down,
+      swarm: "wingston-prod",
+      at_ms: 1,
+      summary: ~s(dashboard fetch failed: {:http_status, 404, "{\"error\":\"swarm_not_found\"}"}),
+      evidence: %{"reason" => ~s({:http_status, 404, "{\"error\":\"swarm_not_found\"}"})},
+      cids: []
+    }
+
+    card = Outbox.alert_card(alert, %{"dashboard_url" => "http://internal-elb", "repo" => "x/y"})
+    text = card_text(card)
+
+    assert card["title"] =~ "restart" or card["title"] =~ "unreachable"
+    assert text =~ "deploy"
+    refute text =~ "investigate"
+    refute text =~ "internal-elb"
+    # no escaped-JSON soup
+    refute text =~ "\\\""
+  end
+
+  test "types without a custom body keep the 💡 explanation and get compact evidence lines" do
+    alert = %{
+      type: :pool_saturated,
+      swarm: "wingston",
+      at_ms: 1,
+      summary: "pool saturated",
+      evidence: %{"leased" => 48, "size" => 48},
+      cids: []
+    }
+
+    card = Outbox.alert_card(alert, %{})
+    text = card_text(card)
+
+    assert text =~ "💡"
+    assert text =~ "leased 48" or text =~ "leased: 48"
+    refute text =~ "{\""
+  end
+
   @tag regression: "F14"
   test "health_rules_gone alert cards include guidance" do
     alert = %{
