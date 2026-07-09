@@ -150,7 +150,7 @@ defmodule Genswarms.Observer.ScopeTest do
 
   # ── tick: alerting ────────────────────────────────────────────────────────
 
-  test "endpoint_down sends a card to :sender with deep-link and investigation prompt" do
+  test "a real endpoint_down (refused) reads plainly and keeps the investigate tail" do
     %{state: state, outbox: outbox} =
       start_scope(fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}})
 
@@ -165,12 +165,15 @@ defmodule Genswarms.Observer.ScopeTest do
     assert msg["action"] == "send_card"
     assert msg["conversation_id"] == "tg:42:0"
     assert msg["card"]["title"] =~ "wingston"
-    assert msg["card"]["title"] =~ "endpoint_down"
+    assert msg["card"]["title"] =~ "unreachable"
 
+    # 2026-07-09 redesign: no internal deep-links or MCP boilerplate — a human
+    # sentence plus the machine tail (a REAL fetch failure stays investigable;
+    # only the restart-shaped swarm_not_found blip is quiet).
     texts = Enum.map(msg["card"]["blocks"], & &1["text"])
-    assert Enum.any?(texts, &(&1 =~ "http://dash.example:4994/api/swarms/wingston/dashboard"))
-    assert Enum.any?(texts, &(&1 =~ "genswarms-fleet"))
-    assert Enum.any?(texts, &(&1 =~ "github.com/genlayerlabs/wingston-rally-bot"))
+    refute Enum.any?(texts, &(&1 =~ "http://dash.example"))
+    refute Enum.any?(texts, &(&1 =~ "genswarms-fleet"))
+    assert Enum.any?(texts, &(&1 =~ "paste to Claude"))
   end
 
   test "cooldown: same (swarm,type) is suppressed within the window and refires after" do
@@ -228,7 +231,7 @@ defmodule Genswarms.Observer.ScopeTest do
     assert reply["alerts"] == 1
 
     [delivery] = sent(outbox)
-    assert Jason.decode!(delivery.content)["card"]["title"] =~ "pool_saturated"
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "pool saturated"
   end
 
   test "a crashing client reads as endpoint_down, not an object crash" do
@@ -242,7 +245,7 @@ defmodule Genswarms.Observer.ScopeTest do
     {reply, _} = decode_reply(tick(state))
     assert reply["alerts"] == 1
     [delivery] = sent(outbox)
-    assert Jason.decode!(delivery.content)["card"]["title"] =~ "endpoint_down"
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "unreachable"
   end
 
   # ── events feed (F1): cursor fetch + UX-detector wiring ──────────────────
@@ -270,7 +273,7 @@ defmodule Genswarms.Observer.ScopeTest do
     assert reply["alerts"] == 1
 
     [delivery] = sent(outbox)
-    assert Jason.decode!(delivery.content)["card"]["title"] =~ "unanswered"
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "waiting"
   end
 
   test "tick fetches the feed with the session cursor, seeded 0, advancing to the returned seq" do
@@ -384,7 +387,7 @@ defmodule Genswarms.Observer.ScopeTest do
     {reply_json, _state} = decode_reply(tick(state))
     assert reply_json["alerts"] == 1
     [delivery] = sent(outbox)
-    assert Jason.decode!(delivery.content)["card"]["title"] =~ "unanswered"
+    assert Jason.decode!(delivery.content)["card"]["title"] =~ "waiting"
   end
 
   test "the first-read drain is bounded — a pathological always-growing feed cannot loop a tick forever" do
@@ -531,7 +534,7 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Enum.count(cards, &(&1["card"]["title"] =~ "alerts_coalesced")) == 1
 
     [coalesced] = Enum.filter(cards, &(&1["card"]["title"] =~ "alerts_coalesced"))
-    evidence_text = Enum.find(coalesced["card"]["blocks"], &(&1["text"] =~ "evidence"))["text"]
+    evidence_text = Enum.find(coalesced["card"]["blocks"], &(&1["text"] =~ "synthetic_"))["text"]
     assert evidence_text =~ "synthetic_7"
     assert evidence_text =~ "synthetic_8"
   end
@@ -585,7 +588,7 @@ defmodule Genswarms.Observer.ScopeTest do
       |> sent()
       |> Enum.map(&Jason.decode!(&1.content)["card"]["title"])
 
-    assert Enum.any?(titles, &(&1 =~ "unanswered"))
+    assert Enum.any?(titles, &(&1 =~ "waiting"))
   end
 
   test "sustained overflow: the coalesced summary respects its own cooldown across ticks" do
@@ -1338,9 +1341,11 @@ defmodule Genswarms.Observer.ScopeTest do
       # which would inflate the unique count by one phantom "cid".
       unanswered_cids =
         sent(outbox)
-        |> Enum.filter(&String.contains?(&1.content, "unanswered for"))
+        |> Enum.filter(&String.contains?(&1.content, "unanswered"))
         |> Enum.flat_map(fn %{content: c} ->
-          Regex.scan(~r/request (tg:\d+:0) unanswered for/, c, capture: :all_but_first)
+          # anchored on the card's machine tail ("· <cid> — paste to Claude"),
+          # which names the ALERT's cid — never the routing conversation_id.
+          Regex.scan(~r/· (tg:\d+:0) — paste to Claude/, c, capture: :all_but_first)
         end)
         |> List.flatten()
         |> Enum.uniq()
@@ -1551,9 +1556,9 @@ defmodule Genswarms.Observer.ScopeTest do
       coalesced = Enum.find(cards, &(&1["card"]["title"] =~ "alerts_coalesced"))
       assert coalesced
 
-      evidence_block = Enum.find(coalesced["card"]["blocks"], &String.starts_with?(&1["text"], "evidence:"))
+      evidence_block = Enum.find(coalesced["card"]["blocks"], &(&1["text"] =~ "health_rule"))
       # 10 (the per-rule cap) - 6 (the budget) = 4 dropped, not 15 - 6 = 9.
-      assert evidence_block["text"] =~ ~s("health_rule":4)
+      assert evidence_block["text"] =~ "health_rule 4"
     end
 
     test "operator signal_rules run against a block even without package health_rules" do

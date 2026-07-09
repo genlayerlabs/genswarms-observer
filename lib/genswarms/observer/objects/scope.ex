@@ -1201,7 +1201,9 @@ defmodule Genswarms.Observer.Objects.Scope do
         state.sender,
         state.name,
         state.alert_conversation_id,
-        Outbox.alert_card(alert, entry)
+        # state.alerts = the recently-emitted list — lets the card correlate
+        # (an unanswered request minutes after an endpoint_down reads "restart").
+        Outbox.alert_card(alert, entry, state.alerts)
       )
 
     state = maybe_escalate(state, alert, now)
