@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- POSITIVE restart detection: new builtin detector
+  `Genswarms.Observer.Detectors.Restarted` consumes the host's
+  `feed_rehydrated` display event (emitted exactly once per pod boot by the
+  dashboard package's DisplayFeed) — until now restarts were only INFERRED
+  from unreachability blips (`endpoint_down` + "swarm_not_found"), so a fast
+  rollout between two ticks was invisible. Emits `:swarm_restarted` (quiet
+  human card — deploy hint, rehydrated row count, no investigate tail) and
+  escalates to `:restart_loop` (investigable) at `>= restart.loop_count`
+  boots within `restart.loop_window_s`. Fresh-window gating
+  (`restart.fresh_window_s`) keeps ring replays of old boots (newly
+  registered swarms, observer restarts) silent; state is seq-deduped and
+  pruned, same discipline as `DeliveryFailureBurst`. The `unanswered`
+  correlation ("their reply died with the old pod") now also matches the
+  positive detection, not just the endpoint_down inference. Hosts whose
+  feed never carries `feed_rehydrated` (micromarkets synthesizes from the
+  log store) simply never fire it.
 - Fase 3 v1: `:diagnostico` bwrap body with isolated network (Σ_pol routing
   to the unhardcoded router, router-driven auto-compaction) + alert
   escalation from `:scope` as diagnosis tasks. Requires engine ≥ #79 for the
