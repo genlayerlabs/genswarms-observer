@@ -80,6 +80,80 @@ defmodule Genswarms.Observer.OutboxTest do
     refute Outbox.alert_card(alert, %{}, [other_swarm]) |> card_text() =~ "restart"
   end
 
+  test "a POSITIVE restart (swarm_restarted) also powers the unanswered correlation" do
+    restart = %{
+      type: :swarm_restarted,
+      swarm: "wingston-prod",
+      at_ms: 1_000_000,
+      summary: "pod restarted (rehydrated 812 feed rows)",
+      evidence: %{"count" => 1, "rehydrated_rows" => 812},
+      cids: []
+    }
+
+    alert = %{
+      type: :unanswered,
+      swarm: "wingston-prod",
+      at_ms: 1_000_000 + 5 * 60_000,
+      summary: "request tg:1:0 unanswered for 15 min",
+      evidence: %{"waited_minutes" => 15},
+      cids: ["tg:1:0"]
+    }
+
+    assert Outbox.alert_card(alert, %{}, [restart]) |> card_text() =~ "restart"
+  end
+
+  test "swarm_restarted renders a quiet human card: deploy hint, row count, no investigate tail" do
+    alert = %{
+      type: :swarm_restarted,
+      swarm: "wingston-prod",
+      at_ms: 1,
+      summary: "pod restarted (rehydrated 812 feed rows)",
+      evidence: %{"count" => 1, "rehydrated_rows" => 812},
+      cids: []
+    }
+
+    card = Outbox.alert_card(alert, %{"dashboard_url" => "http://internal-elb"})
+    text = card_text(card)
+
+    assert card["title"] == "🔄 wingston-prod: pod restarted"
+    assert text =~ "deploy"
+    assert text =~ "812"
+    refute text =~ "investigate"
+    refute text =~ "internal-elb"
+  end
+
+  test "a multi-boot tick shows the count in the title" do
+    alert = %{
+      type: :swarm_restarted,
+      swarm: "w",
+      at_ms: 1,
+      summary: "pod restarted ×2",
+      evidence: %{"count" => 2},
+      cids: []
+    }
+
+    assert Outbox.alert_card(alert, %{})["title"] =~ "×2"
+  end
+
+  test "restart_loop is investigable: explanation + machine tail" do
+    alert = %{
+      type: :restart_loop,
+      swarm: "wingston-prod",
+      at_ms: 1,
+      summary: "4 pod restarts in 1800s",
+      evidence: %{"count" => 4, "window_s" => 1800},
+      cids: []
+    }
+
+    card = Outbox.alert_card(alert, %{})
+    text = card_text(card)
+
+    assert card["title"] =~ "restart loop"
+    assert card["title"] =~ "4"
+    assert text =~ "💡"
+    assert text =~ "investigate"
+  end
+
   test "endpoint_down swarm_not_found reads as a deploy/restart blip without an investigate tail" do
     alert = %{
       type: :endpoint_down,

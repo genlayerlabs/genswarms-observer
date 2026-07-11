@@ -146,7 +146,8 @@ defmodule Genswarms.Observer.Objects.Scope do
     Detectors,
     Genswarms.Observer.Detectors.Unanswered,
     Genswarms.Observer.Detectors.DeliveryFailureBurst,
-    Genswarms.Observer.Detectors.TopicsStale
+    Genswarms.Observer.Detectors.TopicsStale,
+    Genswarms.Observer.Detectors.Restarted
   ]
 
   # O6 fix wave: the LOAD-BEARING relay gate. `@builtin_relay_types` alone is

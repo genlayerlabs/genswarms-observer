@@ -1,7 +1,7 @@
 defmodule Genswarms.Observer.DetectorsUxTest do
   use ExUnit.Case, async: true
 
-  alias Genswarms.Observer.Detectors.{DeliveryFailureBurst, TopicsStale, Unanswered}
+  alias Genswarms.Observer.Detectors.{DeliveryFailureBurst, Restarted, TopicsStale, Unanswered}
 
   # ── REAL feed wire shapes (ground truth for every fixture below) ──────────
   #
@@ -1028,6 +1028,137 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       assert {[], %{ever_seen: false}} =
                Genswarms.Observer.Detectors.TopicsStale.detect(fetched, ctx)
+    end
+  end
+
+  # ── Restarted ────────────────────────────────────────────────────────────────
+
+  describe "Restarted" do
+    @restart_thresholds %{
+      "restart.fresh_window_s" => 900,
+      "restart.loop_count" => 3,
+      "restart.loop_window_s" => 1800
+    }
+
+    # feed_rehydrated carries no cid — DisplayFeed emits it once per host boot
+    # (genswarms-dashboard display_feed.ex: %{kind: :feed_rehydrated, count: n}).
+    defp boot_ev(ms, extra \\ %{}) do
+      seq = System.unique_integer([:positive, :monotonic])
+      Map.merge(%{"kind" => "feed_rehydrated", "seq" => seq, "ts" => ts(ms)}, extra)
+    end
+
+    defp restart_ctx(state, now_ms),
+      do: %{swarm: "w", thresholds: @restart_thresholds, state: state, now_ms: now_ms}
+
+    test "a fresh boot fires one :swarm_restarted with the rehydrated row count" do
+      f = fetched([boot_ev(0, %{"count" => 812})])
+
+      {alerts, state} = Restarted.detect(f, restart_ctx(nil, 60_000))
+
+      assert [
+               %{
+                 type: :swarm_restarted,
+                 key: {"w", :swarm_restarted},
+                 evidence: %{"count" => 1, "rehydrated_rows" => 812}
+               }
+             ] = alerts
+
+      assert hd(alerts).summary =~ "812 feed rows"
+      assert [{_key, 0}] = state.seen
+    end
+
+    test "a boot without a rehydrated count still alerts, without inventing rows" do
+      f = fetched([boot_ev(0)])
+
+      {alerts, _state} = Restarted.detect(f, restart_ctx(nil, 60_000))
+
+      assert [%{type: :swarm_restarted, evidence: %{"count" => 1} = ev}] = alerts
+      refute Map.has_key?(ev, "rehydrated_rows")
+      refute hd(alerts).summary =~ "feed rows"
+    end
+
+    test "a STALE boot (ring replay of an old restart) is remembered but never alerted" do
+      # 20 min old > fresh_window 15 min — e.g. a newly registered swarm
+      # replaying its whole ring into the session cursor.
+      f = fetched([boot_ev(0, %{"count" => 5})])
+
+      assert {[], %{seen: [{_key, 0}]}} = Restarted.detect(f, restart_ctx(nil, 1_200_000))
+    end
+
+    test "an observer restart replaying the SAME events (persisted state, fresh cursor) does not re-alert" do
+      events = [boot_ev(0, %{"count" => 5})]
+
+      {[_alert], state} = Restarted.detect(fetched(events), restart_ctx(nil, 60_000))
+
+      # same events replayed against the persisted state → seq-deduped, silent
+      assert {[], ^state} = Restarted.detect(fetched(events), restart_ctx(state, 120_000))
+    end
+
+    test "boots at/over the loop threshold raise :restart_loop alongside :swarm_restarted" do
+      events = for ms <- [0, 100_000, 200_000], do: boot_ev(ms, %{"count" => 10})
+
+      {alerts, _state} = Restarted.detect(fetched(events), restart_ctx(nil, 250_000))
+
+      assert [
+               %{type: :swarm_restarted, evidence: %{"count" => 3}},
+               %{type: :restart_loop, key: {"w", :restart_loop}, evidence: %{"count" => 3, "window_s" => 1800}}
+             ] = alerts
+
+      assert hd(alerts).summary =~ "×3"
+    end
+
+    test "the loop counts across ticks (accumulate-and-prune state)" do
+      {[_], s1} = Restarted.detect(fetched([boot_ev(0)]), restart_ctx(nil, 60_000))
+      {[_], s2} = Restarted.detect(fetched([boot_ev(600_000)]), restart_ctx(s1, 660_000))
+
+      {alerts, _s3} =
+        Restarted.detect(fetched([boot_ev(1_200_000)]), restart_ctx(s2, 1_260_000))
+
+      assert [%{type: :swarm_restarted}, %{type: :restart_loop, evidence: %{"count" => 3}}] =
+               alerts
+    end
+
+    test "a quiet tick (no new boots) raises nothing even while the loop window is full" do
+      events = for ms <- [0, 100_000, 200_000], do: boot_ev(ms)
+      {[_, _], state} = Restarted.detect(fetched(events), restart_ctx(nil, 250_000))
+
+      # news-driven: without a fresh boot the (cooldown-deduped) loop alert
+      # does not re-fire every tick
+      assert {[], _} = Restarted.detect(fetched([]), restart_ctx(state, 350_000))
+    end
+
+    test "boots age out of the loop window" do
+      events = for ms <- [0, 100_000], do: boot_ev(ms)
+      {[_], s1} = Restarted.detect(fetched(events), restart_ctx(nil, 150_000))
+
+      # third boot arrives after the first two left the 1800s loop window
+      {alerts, _} = Restarted.detect(fetched([boot_ev(2_000_000)]), restart_ctx(s1, 2_050_000))
+
+      assert [%{type: :swarm_restarted}] = alerts
+    end
+
+    test "feed :unavailable / {:error, _} / missing key are no-ops with prior state" do
+      ctx = restart_ctx(:prior, 300_000)
+
+      for feedless <- [
+            %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: :unavailable},
+            %{dashboard: {:ok, %{}}, events: {:ok, []}, feed: {:error, :timeout}},
+            %{dashboard: {:ok, %{}}, events: {:ok, []}}
+          ] do
+        assert {[], :prior} = Restarted.detect(feedless, ctx)
+      end
+    end
+
+    @tag regression: "F2"
+    test "poisoned persisted state restarts clean" do
+      for bad <- [:garbage, %{seen: :nope}, %{seen: [{:key_only}, "x", {nil, :not_ms}]}] do
+        assert {[%{type: :swarm_restarted}], %{seen: [_]}} =
+                 Restarted.detect(fetched([boot_ev(0)]), restart_ctx(bad, 60_000))
+      end
+    end
+
+    test "default_thresholds exposes only its namespaced keys" do
+      assert Restarted.default_thresholds() == @restart_thresholds
     end
   end
 end
