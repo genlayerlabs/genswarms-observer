@@ -55,17 +55,50 @@ defmodule Genswarms.Observer.Detectors.LlmSpend do
 
     case read_spend(fetched, ctx.thresholds) do
       {:ok, value} ->
-        window_ms = round(num(ctx.thresholds, "llm_spend.window_s", 3600) * 1_000)
+        window_ms = pos_window_ms(ctx.thresholds)
         baseline_windows = int(ctx.thresholds, "llm_spend.baseline_windows", 6)
 
         samples =
           (state.samples ++ [{ctx.now_ms, value}])
           |> prune(ctx.now_ms - (baseline_windows + 1) * window_ms)
+          |> drop_before_gap(window_ms)
 
         {verdict(samples, value, ctx, window_ms, baseline_windows), %{samples: samples}}
 
       :no_data ->
         {[], state}
+    end
+  end
+
+  # A hole in the ring is NOT evidence of a quiet period — it is an absence of
+  # evidence, and the two must never be conflated. Samples only land on ticks
+  # where the dashboard actually answered, so a gap means the observer was down,
+  # redeployed, or the block was missing. Judging across one would attribute the
+  # WHOLE gap's spend to the current window (the pre-gap sample being the only
+  # `prev` anchor) while `covered_baseline_windows/4` — which reads the span, not
+  # the density — still claimed a full baseline. Net effect: an observer restart
+  # RELIABLY paged "spend spiking" on its first tick back, on entirely normal
+  # spend. So: keep only the samples after the newest gap, and let coverage
+  # rebuild honestly from there (below min_baseline_windows → no verdict).
+  defp drop_before_gap(samples, window_ms) do
+    samples
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.reduce(samples, fn [{prev_ts, _}, {ts, _}], acc ->
+      if ts - prev_ts > window_ms do
+        Enum.drop_while(acc, fn {s_ts, _} -> s_ts < ts end)
+      else
+        acc
+      end
+    end)
+  end
+
+  # window_s is an x-mutable threshold: 0 would divide by zero every tick
+  # (detector crashes, quarantines, and you get :detector_crashed instead of
+  # spend coverage). Fall back to the default rather than raise.
+  defp pos_window_ms(thresholds) do
+    case Map.get(thresholds, "llm_spend.window_s") do
+      v when is_number(v) and v > 0 -> round(v * 1_000)
+      _ -> 3_600_000
     end
   end
 
@@ -104,22 +137,31 @@ defmodule Genswarms.Observer.Detectors.LlmSpend do
     min(max, div(span - window_ms, window_ms)) |> max(0)
   end
 
-  # Sum of counter increases attributed to samples inside (from, to]. A
-  # sample below its predecessor is a reset (midnight rollover): the new
-  # cumulative IS the spend since the reset. The predecessor value threads
-  # across the whole ring so the first in-interval sample diffs against the
-  # last sample before the interval.
+  # A drop is only a RESET when it actually looks like one. The counter is a
+  # same-day cumulative, so the only legitimate way down is the midnight
+  # rollover to ~0 — after which the new cumulative IS the spend since the
+  # reset. But "went down" is not the same claim as "reset": a stale read from
+  # a replica, a re-aggregation landing a hair lower, float reordering — any
+  # one-cent dip at a $39 cumulative used to contribute the WHOLE $39 to the
+  # current window and page "spending $39/hour" on a swarm that spent nothing.
+  # A real rollover lands far below the previous value; a jitter dip does not.
+  # Anything that isn't unambiguously a rollover contributes zero — under-count
+  # a spike rather than invent one.
+  @reset_ratio 0.5
+
+  defp delta(nil, _value), do: 0.0
+  defp delta(prev, value) when value >= prev, do: value - prev
+  defp delta(prev, value) when value < prev * @reset_ratio, do: value
+  defp delta(_prev, _value), do: 0.0
+
+  # Sum of counter increases attributed to samples inside (from, to]. The
+  # predecessor value threads across the whole ring so the first in-interval
+  # sample diffs against the last sample before the interval.
   defp increase(samples, from, to) do
     samples
     |> Enum.reduce({nil, 0.0}, fn {ts, value}, {prev, acc} ->
-      delta =
-        cond do
-          is_nil(prev) -> 0.0
-          value >= prev -> value - prev
-          true -> value
-        end
-
-      acc = if ts > from and ts <= to, do: acc + delta, else: acc
+      d = delta(prev, value)
+      acc = if ts > from and ts <= to, do: acc + d, else: acc
       {value, acc}
     end)
     |> elem(1)

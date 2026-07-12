@@ -134,4 +134,46 @@ defmodule Genswarms.Observer.DetectorsSpendTest do
     {[], state} = LlmSpend.detect(fetched, ctx(@t0, LlmSpend.init(), overrides))
     assert state.samples == [{@t0, 1.5}]
   end
+  # ── review findings 2026-07-12 (adversarial pass on the merged detector) ──
+
+  test "a jitter dip (stale replica read) is NOT a reset — one cent down must not page $39" do
+    # quiet swarm creeping to ~$39, then a single sample ONE CENT lower
+    base = for i <- 0..27, do: {i * 15, 39.0 + i * 0.0125}
+    {alerts, _} = run(base ++ [{28 * 15, 39.32}])
+
+    assert alerts == [],
+           "a one-cent dip contributed the whole cumulative to the window: " <>
+             inspect(Enum.map(alerts, & &1.summary))
+  end
+
+  test "a real midnight rollover is still treated as spend-since-reset" do
+    base = steady(6)
+    {_, at} = List.last(base)
+    # cumulative drops to near zero (rollover), then a genuine post-midnight spike
+    {alerts, _} = run(base ++ [{6 * 60 + 30, 0.02}, {7 * 60, 3.02}])
+    assert [%{type: :llm_spend_spike}] = alerts
+    _ = at
+  end
+
+  test "a sample GAP (observer down) yields no verdict — never a spike on the first tick back" do
+    # 3h of dense samples, then a 4h hole (observer restarted), then one sample
+    # carrying 4h of perfectly normal spend
+    dense = for i <- 0..11, do: {i * 15, i * 0.0125}
+    {alerts, state} = run(dense ++ [{3 * 60 + 4 * 60, 0.15 + 2.0}])
+
+    assert alerts == [],
+           "the gap's spend was attributed to the last window: " <>
+             inspect(Enum.map(alerts, & &1.evidence))
+
+    # and the ring restarted from the post-gap sample, so coverage rebuilds honestly
+    assert [{_, 2.15}] = state.samples
+  end
+
+  test "llm_spend.window_s = 0 falls back to the default instead of crashing the tick" do
+    {alerts, state} =
+      LlmSpend.detect(fetched(1.0), ctx(@t0, LlmSpend.init(), %{"llm_spend.window_s" => 0}))
+
+    assert alerts == []
+    assert [{@t0, 1.0}] = state.samples
+  end
 end

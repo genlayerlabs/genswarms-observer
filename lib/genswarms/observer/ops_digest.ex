@@ -77,9 +77,48 @@ defmodule Genswarms.Observer.OpsDigest do
 
       _ ->
         title = Map.get(config, "title", "daily ops")
-        {%{"title" => "🌅 #{swarm} · #{title} · #{day}", "blocks" => blocks}, day}
+        card = %{"title" => "🌅 #{swarm} · #{title} · #{day}", "blocks" => blocks}
+        {cap_card(card), day}
     end
   end
+
+  # Telegram rejects an oversized message, and a rejected digest is NOT marked
+  # sent — so without a cap a rich config would re-send and re-fail on EVERY
+  # tick until midnight, stamping sender health red each time. Drop whole
+  # sections from the end until it fits (same 3500-char budget Digest uses) and
+  # say how many were dropped, rather than truncate mid-number.
+  @card_text_cap 3_500
+
+  defp cap_card(%{"title" => title, "blocks" => blocks} = card) do
+    if card_len(title, blocks) <= @card_text_cap do
+      card
+    else
+      kept = drop_to_fit(title, blocks)
+      dropped = length(blocks) - length(kept)
+
+      %{
+        card
+        | "blocks" =>
+            kept ++ [%{"kind" => "paragraph", "text" => "… +#{dropped} more sections (too long)"}]
+      }
+    end
+  end
+
+  defp drop_to_fit(_title, []), do: []
+
+  defp drop_to_fit(title, blocks) do
+    kept = Enum.drop(blocks, -1)
+
+    # the marker line costs ~40 chars; leave room for it
+    if kept != [] and card_len(title, kept) <= @card_text_cap - 40 do
+      kept
+    else
+      drop_to_fit(title, kept)
+    end
+  end
+
+  defp card_len(title, blocks),
+    do: String.length(Enum.join([title | Enum.map(blocks, & &1["text"])], "\n"))
 
   defp swarm_included?(swarm, config) do
     case Map.get(config, "swarms") do
@@ -208,11 +247,16 @@ defmodule Genswarms.Observer.OpsDigest do
   defp safe(other), do: other |> to_string() |> Digest.sanitize_label()
 
   # Numbers render as-is. Envelope strings are remote data → sanitized —
-  # EXCEPT pure numeric display values ("$8.123456", "66%", "2.387737"):
-  # they carry no PII surface by construction, and the scrubber's
-  # phone/digit-run patterns would eat exactly the money the digest exists
-  # to show.
-  @numericish ~r/^[$€£]?\d[\d,]*(\.\d+)?%?$/
+  # EXCEPT *formatted* numeric display values ("$8.123456", "66%", "1,231"):
+  # the scrubber's phone/digit-run rules would eat exactly the money the
+  # digest exists to show.
+  #
+  # The bypass must not become a PII hole: a BARE long digit run is precisely
+  # what `\d{6,}` exists to scrub (chat ids, phone numbers), so it does NOT
+  # qualify — only values carrying a currency symbol, a decimal point, a
+  # thousands separator or a percent sign, i.e. things no id looks like.
+  # `\z` (not `$`) so a trailing newline can't smuggle content past the anchor.
+  @numericish ~r/\A(?:[$€£]\d[\d,]*(?:\.\d+)?|\d[\d,]*\.\d+|\d{1,3}(?:,\d{3})+|\d{1,5}(?:\.\d+)?%?|\d+%)\z/
   defp safe_value(v) when is_number(v), do: to_string(v)
   defp safe_value(v) when is_boolean(v), do: to_string(v)
 
@@ -295,7 +339,7 @@ defmodule Genswarms.Observer.OpsDigest do
           "page" => required_string!(section, :page),
           "section" => required_string!(section, :section),
           "row" => row,
-          "row_key" => key(section, :row_key, "day"),
+          "row_key" => row_key!(section),
           "title" => optional_string!(section, :title),
           "columns" => optional_string_list!(section, :columns)
         }
@@ -309,6 +353,20 @@ defmodule Genswarms.Observer.OpsDigest do
 
   defp build_section!(other) do
     raise ArgumentError, "ops_digest sections must be maps, got #{inspect(other)}"
+  end
+
+  # Defaults to "day". A non-string here used to sail through validation and
+  # then quietly make select_row/4 find no date, dropping the section without
+  # a word — validate it like every other named field instead.
+  defp row_key!(section) do
+    case key(section, :row_key, "day") do
+      s when is_binary(s) and s != "" ->
+        s
+
+      other ->
+        raise ArgumentError,
+              "ops_digest page_row row_key must be a non-empty string, got #{inspect(other)}"
+    end
   end
 
   defp required_string!(section, k) do
@@ -326,10 +384,18 @@ defmodule Genswarms.Observer.OpsDigest do
     end
   end
 
+  # An EMPTY list is not "no filter" — it selects nothing, so the section can
+  # never render and the digest silently never sends (no log, no raise): the
+  # exact opposite of fail-closed. Omit the key to mean "all scalars".
   defp optional_string_list!(section, k) do
     case key(section, k, nil) do
       nil ->
         nil
+
+      [] ->
+        raise ArgumentError,
+              "ops_digest section #{k} is an empty list — it would select nothing and the " <>
+                "digest would never send; omit #{k} to include everything"
 
       list when is_list(list) ->
         unless Enum.all?(list, &is_binary/1) do
