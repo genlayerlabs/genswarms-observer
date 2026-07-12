@@ -22,21 +22,41 @@ defmodule Genswarms.Observer.Ingest do
 
   require Logger
 
-  @doc "See moduledoc. Returns `{%{dashboard:, events:, feed:}, proposed_cursor}`."
+  @doc """
+  See moduledoc. Returns `{%{dashboard:, events:, feed:}, proposed_cursor}`.
+
+  `swarm` is the observer-side identity (the registry key — alert titles,
+  dedupe, MCP addressing). What goes on the WIRE is the entry's `"name"`
+  when set: a fleet can watch two deployments of the same swarm (e.g. a
+  local `wingston` and the prod one) under distinct registry keys while
+  each backend still only answers to its own wire name. Without the
+  override the key doubles as the wire name, as before.
+  """
   def fetch(client, client_opts, swarm, entry, cursor, max_pages) do
     token = resolve_token(entry)
     base = entry["dashboard_url"]
+    wire = wire_name(entry, swarm)
 
-    {feed, proposed} = drain_feed(client, client_opts, swarm, base, token, cursor || 0, [], max_pages)
+    {feed, proposed} = drain_feed(client, client_opts, wire, base, token, cursor || 0, [], max_pages)
 
     data = %{
-      dashboard: safe_call(client, :get_dashboard, [base, swarm, token, client_opts]),
-      events: safe_call(client, :get_events, [base, swarm, token, client_opts]),
+      dashboard: safe_call(client, :get_dashboard, [base, wire, token, client_opts]),
+      events: safe_call(client, :get_events, [base, wire, token, client_opts]),
       feed: feed
     }
 
     {data, proposed}
   end
+
+  @doc "The name the observed backend answers to: entry `\"name\"` override or the registry key."
+  def wire_name(entry, swarm) when is_map(entry) do
+    case entry["name"] do
+      name when is_binary(name) and name != "" -> name
+      _ -> to_string(swarm)
+    end
+  end
+
+  def wire_name(_entry, swarm), do: to_string(swarm)
 
   defp drain_feed(client, opts, swarm, base, token, since, acc, pages_left) do
     case safe_call(client, :get_events_feed, [base, swarm, since, token, opts]) do
