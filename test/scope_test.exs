@@ -1756,6 +1756,34 @@ defmodule Genswarms.Observer.ScopeTest do
       end
     end
 
+    test "a corrupt FUTURE ops_sent day is dropped, not honored (it would skip a whole day silently)" do
+      # a store carrying tomorrow's date for this swarm: if it survived load,
+      # tomorrow's `last_sent_day == day` check would suppress that day's digest
+      # entirely — no card, no log, no trace.
+      tomorrow =
+        @t0 |> DateTime.from_unix!(:millisecond) |> DateTime.to_date() |> Date.add(1) |> Date.to_iso8601()
+
+      defmodule FutureStore do
+        @behaviour Genswarms.Observer.Store
+        def load, do: {:ok, %{ops_sent: %{"wingston" => Process.get(:future_day)}, save_seq: 1}}
+        def save(_), do: :ok
+      end
+
+      Process.put(:future_day, tomorrow)
+
+      %{state: state, outbox: outbox} =
+        start_scope(
+          fixture: %{"wingston" => %{dashboard: {:ok, ops_envelope()}, events: {:ok, []}}},
+          config: Map.put(ops_config(), :store_mod, FutureStore)
+        )
+
+      refute Map.has_key?(state.ops_sent, "wingston"),
+             "tomorrow's date survived validation — the digest would be silently skipped"
+
+      {_reply, _state} = decode_reply(tick(state))
+      assert length(ops_cards(outbox)) == 1
+    end
+
     test "without ops_digest config nothing changes" do
       %{state: state, outbox: outbox} =
         start_scope(fixture: %{"wingston" => %{dashboard: {:ok, ops_envelope()}, events: {:ok, []}}})

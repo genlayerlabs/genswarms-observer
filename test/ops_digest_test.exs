@@ -213,4 +213,71 @@ defmodule Genswarms.Observer.OpsDigestTest do
     assert cfg["hour_utc"] == 9
     assert [%{"kind" => "block", "block" => "audience"}] = cfg["sections"]
   end
+  # ── review findings 2026-07-12 (adversarial pass) ──
+
+  test "a bare long digit run (chat id / phone) is still scrubbed — the numeric bypass is not a PII hole" do
+    env =
+      put_in(envelope(), ["extensions", "audience"], %{
+        "last_chat_id" => "8452213330",
+        "spent" => "$8.123456",
+        "cache" => "66%",
+        "count" => "1,231"
+      })
+
+    cfg = config(%{"sections" => [%{"kind" => "block", "block" => "audience"}]})
+    text = text(OpsDigest.plan("wingston", env, cfg, nil, @at_8am))
+
+    # money/percent/thousands survive the scrubber...
+    assert text =~ "$8.123456"
+    assert text =~ "66%"
+    assert text =~ "1,231"
+    # ...but a bare id-shaped digit run does NOT
+    refute text =~ "8452213330"
+  end
+
+  test "a trailing newline cannot smuggle content past the numeric anchor" do
+    env = put_in(envelope(), ["extensions", "audience"], %{"x" => "8452213330\n"})
+    cfg = config(%{"sections" => [%{"kind" => "block", "block" => "audience"}]})
+
+    case OpsDigest.plan("wingston", env, cfg, nil, @at_8am) do
+      :skip -> :ok
+      result -> refute text(result) =~ "8452213330"
+    end
+  end
+
+  test "an empty keys/columns list is rejected at boot, not silently never-sent" do
+    for bad <- [
+          %{"sections" => [%{"kind" => "block", "block" => "audience", "keys" => []}]},
+          %{"sections" => [%{"kind" => "page_row", "page" => "growth", "section" => "L", "columns" => []}]}
+        ] do
+      assert_raise ArgumentError, ~r/empty list/, fn -> OpsDigest.build!(bad) end
+    end
+  end
+
+  test "a non-string row_key is rejected at boot instead of silently dropping the section" do
+    assert_raise ArgumentError, ~r/row_key/, fn ->
+      OpsDigest.build!(%{
+        "sections" => [%{"kind" => "page_row", "page" => "g", "section" => "s", "row_key" => 7}]
+      })
+    end
+  end
+
+  test "an oversized card is capped (a rejected send would otherwise retry every tick all day)" do
+    big = Map.new(1..40, fn i -> {"key_number_#{i}", String.duplicate("v", 70)} end)
+    env = put_in(envelope(), ["extensions", "audience"], big)
+
+    cfg =
+      config(%{
+        "sections" =>
+          for i <- 1..12 do
+            %{"kind" => "block", "block" => "audience", "title" => "section #{i}"}
+          end
+      })
+
+    {card, _day} = OpsDigest.plan("wingston", env, cfg, nil, @at_8am)
+    len = String.length(Enum.join([card["title"] | Enum.map(card["blocks"], & &1["text"])], "\n"))
+
+    assert len <= 3_500, "card is #{len} chars — Telegram would reject it and we would retry forever"
+    assert List.last(card["blocks"])["text"] =~ "more sections"
+  end
 end

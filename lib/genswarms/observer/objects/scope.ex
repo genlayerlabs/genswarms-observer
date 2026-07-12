@@ -414,14 +414,17 @@ defmodule Genswarms.Observer.Objects.Scope do
 
   defp validate_seen_periods(_, _now), do: %{}
 
-  # ops_sent: %{swarm => "YYYY-MM-DD" last delivered}. Same trust posture as
-  # seen_periods — a corrupt/future entry is dropped (worst case: one extra
-  # digest card, idempotent content).
+  # ops_sent: %{swarm => "YYYY-MM-DD" last delivered}. Unlike seen_periods —
+  # remote period ids, where "not after tomorrow" is the right tolerance —
+  # these days are SELF-generated, so anything past today is corrupt. And a
+  # future entry is not harmless here: `last_sent_day == day` would silently
+  # skip that day's digest entirely (no card, no log). Drop it; the worst case
+  # then is one extra card, which is idempotent content.
   defp validate_ops_sent(map, now) when is_map(map) do
-    tomorrow = now |> DateTime.from_unix!(:millisecond) |> DateTime.to_date() |> Date.add(1)
+    today = now |> DateTime.from_unix!(:millisecond) |> DateTime.to_date()
 
     map
-    |> Enum.filter(fn {swarm, day} -> is_binary(swarm) and valid_period?(day, tomorrow) end)
+    |> Enum.filter(fn {swarm, day} -> is_binary(swarm) and valid_period?(day, today) end)
     |> Map.new()
   end
 
