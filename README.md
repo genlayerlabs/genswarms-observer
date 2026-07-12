@@ -21,8 +21,51 @@ as diagnosis tasks to an isolated agent.
 | `error_burst`    | ≥ `error_burst_count` (5) error events within `error_burst_window_s` (60) |
 | `budget_block`   | `llm_proxy_global_block` seen in events                          |
 | `pool_saturated` | `leased == size` sustained for `pool_saturated_s` (120)          |
+| `llm_spend_spike` | spend in the last `llm_spend.window_s` (3600) is ≥ `llm_spend.factor` (3.0) × the trailing per-window baseline AND ≥ `llm_spend.min_usd` (1.0) — see `Detectors.LlmSpend` |
 
 Dedupe + cooldown per `(swarm, type)` in `:scope` (`cooldown_minutes`, 30).
+
+`LlmSpend` reads a cumulative same-day dollar value from the envelope
+(default `extensions.llm_proxy_budget.spent_usd`, retarget via
+`llm_spend.path`) and compares the last window against the swarm's own
+trailing baseline (`llm_spend.baseline_windows`, needing at least
+`llm_spend.min_baseline_windows` of coverage) — the complement to the
+llm-proxy package's 75%/90%-of-ceiling rules: it catches a runaway loop
+while it is still cheap. Reset-aware (midnight rollover reads as
+spend-since-reset); warm-up after an observer restart is bounded by the
+window count unless a durable `store_mod` is configured.
+
+## Daily ops digest (`ops_digest`, boot-only)
+
+One card per observed swarm per day, on the first tick at/after
+`hour_utc`, rendered straight from the envelope — no sampling state, so
+it composes from the DURABLE numbers hosts already publish. Sections
+address the envelope's two rendering conventions (never a consumer's key
+names): `"block"` picks scalar keys out of one extension block;
+`"page_row"` picks one row out of a `dashboard_pages` table section
+(`row: "latest_closed"` = the newest row dated before today UTC —
+yesterday's final by construction). Delivery marks the day only after the
+card actually sent; configured via `OBSERVER_OPS_DIGEST_JSON`, e.g.:
+
+```json
+{"hour_utc": 7, "sections": [
+  {"kind": "block", "block": "audience", "title": "audience now",
+   "keys": ["reachable_dm", "push_eligible", "blocked", "opted_out"]},
+  {"kind": "page_row", "page": "growth", "section": "Last 7 days",
+   "title": "engagement"},
+  {"kind": "page_row", "page": "proxy-router", "section": "History",
+   "title": "llm", "columns": ["spent", "router", "req", "tokens"]}
+]}
+```
+
+## Recovery hints (`registry.<swarm>.recover_hint`)
+
+An unanswered-user card that correlates with a recent restart names a user
+whose in-flight reply died with the old pod — recoverable, not just
+diagnosable. A per-swarm `recover_hint` template (e.g.
+`"/reach {cid} <note> from the operator chat"`) renders on exactly those
+cards with `{cid}` replaced, so the operator can act from the card itself.
+Config-owned: the package never hardcodes a consumer's command vocabulary.
 
 ## Custom detectors (boot-only)
 

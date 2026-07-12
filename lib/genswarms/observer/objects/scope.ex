@@ -95,6 +95,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   alias Genswarms.Observer.Digest
   alias Genswarms.Observer.Ingest
   alias Genswarms.Observer.Lifecycle
+  alias Genswarms.Observer.OpsDigest
   alias Genswarms.Observer.Outbox
   alias Genswarms.Observer.Signals
 
@@ -147,7 +148,8 @@ defmodule Genswarms.Observer.Objects.Scope do
     Genswarms.Observer.Detectors.Unanswered,
     Genswarms.Observer.Detectors.DeliveryFailureBurst,
     Genswarms.Observer.Detectors.TopicsStale,
-    Genswarms.Observer.Detectors.Restarted
+    Genswarms.Observer.Detectors.Restarted,
+    Genswarms.Observer.Detectors.LlmSpend
   ]
 
   # O6 fix wave: the LOAD-BEARING relay gate. `@builtin_relay_types` alone is
@@ -221,6 +223,11 @@ defmodule Genswarms.Observer.Objects.Scope do
       last_alert: %{},
       # O4: unseen digest period ids per swarm. Persisted, validated on load.
       seen_periods: %{},
+      # Daily ops digest: validated boot-only config (nil = off) and the
+      # per-swarm day already delivered (persisted; marked only after the
+      # card's delivery returned :ok — Digest's seen-after-send invariant).
+      ops_digest: OpsDigest.build!(cfg(config, :ops_digest, nil)),
+      ops_sent: %{},
       # This session's own durability watermark. A caller/host that kept
       # one across a restart passes it in; a genuinely first-ever boot has
       # nothing to compare against, so 0 never false-positives a rollback.
@@ -307,6 +314,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     last_alert = saved |> Map.get(:last_alert, %{}) |> validate_last_alert(now)
     seen_periods = saved |> Map.get(:seen_periods, %{}) |> validate_seen_periods(now)
     signals = saved |> Map.get(:signals, %{}) |> validate_signals()
+    ops_sent = saved |> Map.get(:ops_sent, %{}) |> validate_ops_sent(now)
 
     if loaded_seq < state.save_seq do
       Logger.warning(
@@ -319,6 +327,7 @@ defmodule Genswarms.Observer.Objects.Scope do
           last_alert: last_alert,
           seen_periods: seen_periods,
           signals: signals,
+          ops_sent: ops_sent,
           pending_alerts: [rollback_alert(state, loaded_seq, now)]
       }
     else
@@ -328,6 +337,7 @@ defmodule Genswarms.Observer.Objects.Scope do
           last_alert: last_alert,
           seen_periods: seen_periods,
           signals: signals,
+          ops_sent: ops_sent,
           save_seq: loaded_seq
       }
     end
@@ -403,6 +413,19 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   defp validate_seen_periods(_, _now), do: %{}
+
+  # ops_sent: %{swarm => "YYYY-MM-DD" last delivered}. Same trust posture as
+  # seen_periods — a corrupt/future entry is dropped (worst case: one extra
+  # digest card, idempotent content).
+  defp validate_ops_sent(map, now) when is_map(map) do
+    tomorrow = now |> DateTime.from_unix!(:millisecond) |> DateTime.to_date() |> Date.add(1)
+
+    map
+    |> Enum.filter(fn {swarm, day} -> is_binary(swarm) and valid_period?(day, tomorrow) end)
+    |> Map.new()
+  end
+
+  defp validate_ops_sent(_, _now), do: %{}
 
   defp periods_to_list(%MapSet{} = set), do: MapSet.to_list(set)
   defp periods_to_list(list) when is_list(list), do: list
@@ -480,6 +503,7 @@ defmodule Genswarms.Observer.Objects.Scope do
       last_alert: state.last_alert,
       seen_periods: state.seen_periods,
       signals: state.signals,
+      ops_sent: state.ops_sent,
       save_seq: next_seq
     }
 
@@ -596,6 +620,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     orig_last_alert = state.last_alert
     orig_seen_periods = state.seen_periods
     orig_signals = state.signals
+    orig_ops_sent = state.ops_sent
 
     {state, pending_fired, pending_suppressed} = drain_pending_alerts(state, now)
 
@@ -649,8 +674,10 @@ defmodule Genswarms.Observer.Objects.Scope do
         st = %{st | last_alert: new_last_alert}
         st = Enum.reduce(budgeted, st, fn alert, st -> emit_alert(st, alert, entry, now) end)
         st = apply_on_emitted(st, swarm, budgeted)
+        log_emitted(swarm, budgeted, tick_suppressed)
 
         st = deliver_digest(st, swarm, data, now)
+        st = deliver_ops_digest(st, swarm, data, now)
 
         {st, fired + length(budgeted), supp + tick_suppressed}
       end)
@@ -659,7 +686,8 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     state =
       if state.det != orig_det or state.last_alert != orig_last_alert or
-           state.seen_periods != orig_seen_periods or state.signals != orig_signals do
+           state.seen_periods != orig_seen_periods or state.signals != orig_signals or
+           state.ops_sent != orig_ops_sent do
         persist(state)
       else
         state
@@ -672,6 +700,29 @@ defmodule Genswarms.Observer.Objects.Scope do
        alerts: fired,
        suppressed: suppressed
      }), state}
+  end
+
+  # The observer's own log used to say only "sender received message from
+  # scope" — one line per swarm per alerting tick names what actually went
+  # out, so the send history reconstructs from the log alone, without the
+  # Telegram transcript. Quiet ticks (nothing sent, nothing suppressed) log
+  # nothing.
+  defp log_emitted(_swarm, [], 0), do: :ok
+
+  defp log_emitted(swarm, budgeted, suppressed) do
+    sent =
+      case budgeted do
+        [] ->
+          "none"
+
+        _ ->
+          budgeted
+          |> Enum.frequencies_by(& &1.type)
+          |> Enum.sort()
+          |> Enum.map_join(",", fn {type, n} -> "#{type}:#{n}" end)
+      end
+
+    Logger.info("[observer] alerts swarm=#{swarm} sent=#{sent} suppressed=#{suppressed}")
   end
 
   # Rollback (and, later, any other system-level) alerts detected outside a
@@ -772,6 +823,36 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   defp deliver_digest(state, _swarm, _data, _now), do: state
+
+  # ── daily ops digest: envelope numbers → one morning card per swarm ───────
+  #
+  # Same shape as deliver_digest above: runs over the tick's existing fetch,
+  # pure planner decides, Scope owns delivery and the mark-after-send
+  # invariant. `OpsDigest.plan/5` gates on hour_utc and the per-swarm
+  # last-sent day, so this is a no-op on all but ~one tick per day.
+  defp deliver_ops_digest(%{ops_digest: nil} = state, _swarm, _data, _now), do: state
+
+  defp deliver_ops_digest(state, swarm, %{dashboard: {:ok, envelope}}, now) do
+    case OpsDigest.plan(swarm, envelope, state.ops_digest, Map.get(state.ops_sent, swarm), now) do
+      :skip ->
+        state
+
+      {card, day} ->
+        result =
+          Outbox.send_card(state.deliver_fn, state.sender, state.name, state.alert_conversation_id, card)
+
+        state = record_sender_batch(state, swarm, [result], now)
+
+        if result == :ok do
+          Logger.info("[observer] ops_digest swarm=#{swarm} day=#{day} sent")
+          %{state | ops_sent: Map.put(state.ops_sent, swarm, day)}
+        else
+          state
+        end
+    end
+  end
+
+  defp deliver_ops_digest(state, _swarm, _data, _now), do: state
 
   # ── Signals stage (Task 6): declarative health_rules → alerts ─────────────
   #
@@ -1442,11 +1523,17 @@ defmodule Genswarms.Observer.Objects.Scope do
     %{
       "dashboard_url" => entry_get(entry, :dashboard_url),
       "token_env" => entry_get(entry, :token_env),
-      "repo" => entry_get(entry, :repo)
+      "repo" => entry_get(entry, :repo),
+      # Operator-authored recovery template for restart-dropped users —
+      # "{cid}" is replaced with the waiting user's cid on the card (see
+      # Outbox.alert_card). Config-owned so the package never names a
+      # consumer's command vocabulary.
+      "recover_hint" => entry_get(entry, :recover_hint)
     }
   end
 
-  defp normalize_entry(_), do: %{"dashboard_url" => nil, "token_env" => nil, "repo" => nil}
+  defp normalize_entry(_),
+    do: %{"dashboard_url" => nil, "token_env" => nil, "repo" => nil, "recover_hint" => nil}
 
   defp entry_get(entry, key),
     do: Map.get(entry, key, Map.get(entry, to_string(key)))

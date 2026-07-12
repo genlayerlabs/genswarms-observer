@@ -39,12 +39,12 @@ defmodule Genswarms.Observer.Outbox do
   # `recent` (the emitter's kept-alerts list) powers correlation: an unanswered
   # request minutes after an endpoint_down says "restart", not just "no reply".
   @recent_restart_window_ms 15 * 60_000
-  @investigable ~w(unanswered error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback restart_loop)a
+  @investigable ~w(unanswered error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback restart_loop llm_spend_spike)a
 
   def alert_card(alert, entry, recent \\ [])
 
-  def alert_card(alert, _entry, recent) do
-    custom = body_for(alert, recent)
+  def alert_card(alert, entry, recent) do
+    custom = body_for(alert, recent, entry)
 
     blocks =
       [%{"kind" => "paragraph", "text" => custom || alert.summary}] ++
@@ -82,6 +82,9 @@ defmodule Genswarms.Observer.Outbox do
   end
 
   defp title_for(%{type: :budget_block, swarm: swarm}), do: "💸 #{swarm}: LLM budget block"
+
+  defp title_for(%{type: :llm_spend_spike, swarm: swarm}),
+    do: "📈 #{swarm}: LLM spend spiking"
   defp title_for(%{type: :error_burst, swarm: swarm}), do: "🔥 #{swarm}: error burst"
 
   defp title_for(%{type: :reply_failed_burst, swarm: swarm}),
@@ -92,7 +95,7 @@ defmodule Genswarms.Observer.Outbox do
   defp title_for(alert), do: "⚠️ observer: #{alert.swarm} · #{alert.type}"
 
   # Custom human bodies — nil falls back to alert.summary + the 💡 explanation.
-  defp body_for(%{type: :unanswered} = alert, recent) do
+  defp body_for(%{type: :unanswered} = alert, recent, entry) do
     waited = Map.get(alert.evidence || %{}, "waited_minutes")
     mins = if is_integer(waited), do: "#{waited} min", else: "a while"
 
@@ -108,19 +111,20 @@ defmodule Genswarms.Observer.Outbox do
 
     if restart do
       base <>
-        " A restart was seen just before — their reply likely died with the old pod. Their next message gets a fresh agent."
+        " A restart was seen just before — their reply likely died with the old pod. Their next message gets a fresh agent." <>
+        recover_line(alert, entry)
     else
       base <> " Their next message gets a fresh agent, or paste this to Claude to dig in."
     end
   end
 
-  defp body_for(%{type: :endpoint_down} = alert, _recent) do
+  defp body_for(%{type: :endpoint_down} = alert, _recent, _entry) do
     if restart_shaped?(alert) do
       "The fleet API doesn't know the swarm right now — almost always a deploy rolling out or the pod rebooting. If no deploy was expected, treat this as real and check the pod."
     end
   end
 
-  defp body_for(%{type: :swarm_restarted} = alert, _recent) do
+  defp body_for(%{type: :swarm_restarted} = alert, _recent, _entry) do
     rows =
       case Map.get(alert.evidence || %{}, "rehydrated_rows") do
         n when is_integer(n) -> " and reloaded #{n} feed rows"
@@ -130,7 +134,27 @@ defmodule Genswarms.Observer.Outbox do
     "The pod booted#{rows}. Expected right after a deploy; if nothing was deployed, check why it died. In-flight replies died with the old pod — affected users get a fresh agent on their next message."
   end
 
-  defp body_for(_alert, _recent), do: nil
+  defp body_for(_alert, _recent, _entry), do: nil
+
+  # A restart-dropped user is RECOVERABLE, not just diagnosable: the
+  # per-swarm `recover_hint` registry template (e.g. "/reach {cid} …")
+  # renders with the waiting user's cid, so the operator can act from the
+  # card itself. No hint configured (or no cid on the alert) → no line.
+  defp recover_line(alert, entry) do
+    hint = if is_map(entry), do: Map.get(entry, "recover_hint")
+
+    cid =
+      case Map.get(alert, :cids) do
+        [cid | _] when is_binary(cid) -> cid
+        _ -> nil
+      end
+
+    if is_binary(hint) and hint != "" and is_binary(cid) do
+      "\n→ they're still waiting — " <> String.replace(hint, "{cid}", cid)
+    else
+      ""
+    end
+  end
 
   defp restart_shaped?(alert),
     do: String.contains?(to_string(alert.summary), "swarm_not_found")
@@ -202,6 +226,7 @@ defmodule Genswarms.Observer.Outbox do
   def explain(:error_burst), do: "Recent error events crossed the burst threshold; inspect the event sample and latest dashboard state."
   def explain(:health_rule), do: "A declarative health rule fired; inspect the named extension block and rule id in the evidence."
   def explain(:health_rules_gone), do: "A package block stopped publishing health_rules; check for component downtime or a dashboard regression."
+  def explain(:llm_spend_spike), do: "Spend in the last window is far above the swarm's own trailing baseline — a runaway loop or usage surge; check the proxy-router page and recent sessions before the daily ceiling blocks agents."
   def explain(:pool_saturated), do: "The worker pool is saturated; inspect active sessions and stuck or long-running agents."
   def explain(:reply_failed_burst), do: "Reply delivery failures are spiking; inspect sender health and Telegram API responses."
   def explain(:restart_loop), do: "The pod booted several times in a short window — crash loop or a stuck rollout; inspect pod events and the latest deploy."

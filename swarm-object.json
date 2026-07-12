@@ -21,14 +21,15 @@
           "properties": {
             "dashboard_url": { "type": "string", "description": "Dashboard backend base URL (e.g. http://127.0.0.1:4994)." },
             "token_env": { "type": "string", "description": "Env var NAME holding the dashboard bearer token; omit for loopback dashboards." },
-            "repo": { "type": "string", "description": "GitHub org/repo of the observed swarm, linked in alert cards." }
+            "repo": { "type": "string", "description": "GitHub org/repo of the observed swarm, linked in alert cards." },
+            "recover_hint": { "type": "string", "description": "Operator-authored recovery template rendered on restart-correlated unanswered cards, with {cid} replaced by the waiting user's cid (e.g. \"/reach {cid} <note> from the operator chat\"). Omit for no recovery line." }
           }
         }
       },
       "thresholds": {
         "type": "object",
         "x-mutable": true,
-        "description": "Detector tuning overrides: stall_minutes (10), error_burst_count (5), error_burst_window_s (60), pool_saturated_s (120), unanswered.minutes (15), delivery_failure.count (3), delivery_failure.window_s (600), topics_stale.periods (1), plus each custom detector's default_thresholds/0 keys."
+        "description": "Detector tuning overrides: stall_minutes (10), error_burst_count (5), error_burst_window_s (60), pool_saturated_s (120), unanswered.minutes (15), delivery_failure.count (3), delivery_failure.window_s (600), topics_stale.periods (1), llm_spend.window_s (3600) / llm_spend.factor (3.0) / llm_spend.min_usd (1.0) / llm_spend.baseline_windows (6) / llm_spend.min_baseline_windows (2) / llm_spend.path ([\"llm_proxy_budget\",\"spent_usd\"], keys under extensions), plus each custom detector's default_thresholds/0 keys."
       },
       "cooldown_minutes": {
         "type": "integer",
@@ -97,6 +98,16 @@
       "deliver_fn": {
         "type": "string",
         "description": "Injectable delivery seam to the sender (tests only; default engine ObjectServer)."
+      },
+      "ops_digest": {
+        "type": "object",
+        "description": "Once-daily ops digest card per observed swarm, rendered from the dashboard envelope on the first tick at/after hour_utc (default 7). Sections address the envelope's two rendering conventions, never a consumer's key names: kind \"block\" reads scalar keys out of one extension block ({block, title?, keys?}); kind \"page_row\" reads one row of a dashboard_pages table section ({page, section (title prefix), row: \"latest_closed\"|\"today\", row_key (default \"day\"), title?, columns?}) — \"latest_closed\" picks the newest row dated before today UTC, i.e. yesterday's durable final. Optional swarms list filters which observed swarms send; omitted = all. Validated FAIL-CLOSED at boot (operator config, same trust class as signal_rules). Boot-time only, never re-read, NEVER x-mutable. The per-swarm sent-day is persisted via store_mod and marked only after the card actually delivered.",
+        "properties": {
+          "hour_utc": { "type": "integer", "description": "UTC hour (0..23) after which the day's digest sends (default 7)." },
+          "swarms": { "type": "array", "items": { "type": "string" }, "description": "Observed swarm names that get a digest; omit for all." },
+          "title": { "type": "string", "description": "Card title suffix (default \"daily ops\")." },
+          "sections": { "type": "array", "items": { "type": "object" }, "description": "Section specs (kind \"block\" or \"page_row\", see above)." }
+        }
       },
       "signal_rules": {
         "type": "array",

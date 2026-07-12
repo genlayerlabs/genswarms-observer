@@ -102,6 +102,67 @@ defmodule Genswarms.Observer.OutboxTest do
     assert Outbox.alert_card(alert, %{}, [restart]) |> card_text() =~ "restart"
   end
 
+  test "a restart-correlated unanswered card renders the recover_hint with the cid" do
+    restart = %{
+      type: :swarm_restarted,
+      swarm: "wingston",
+      at_ms: 1_000_000,
+      summary: "pod restarted",
+      evidence: %{"count" => 1},
+      cids: []
+    }
+
+    alert = %{
+      type: :unanswered,
+      swarm: "wingston",
+      at_ms: 1_000_000 + 5 * 60_000,
+      summary: "request tg:7790150175:0 unanswered for 15 min",
+      evidence: %{"waited_minutes" => 15},
+      cids: ["tg:7790150175:0"]
+    }
+
+    entry = %{"recover_hint" => "/reach {cid} <note> from the operator chat"}
+
+    text = Outbox.alert_card(alert, entry, [restart]) |> card_text()
+    assert text =~ "still waiting"
+    assert text =~ "/reach tg:7790150175:0 <note> from the operator chat"
+
+    # no hint configured → no recover line (the correlation copy stays)
+    text = Outbox.alert_card(alert, %{}, [restart]) |> card_text()
+    assert text =~ "restart"
+    refute text =~ "/reach"
+
+    # hint without a restart correlation → no recover line either
+    refute Outbox.alert_card(alert, entry, []) |> card_text() =~ "/reach"
+
+    # no cid on the alert → no recover line, no crash
+    refute Outbox.alert_card(%{alert | cids: []}, entry, [restart]) |> card_text() =~ "/reach"
+  end
+
+  test "llm_spend_spike gets a title, an explanation and an investigate tail" do
+    alert = %{
+      type: :llm_spend_spike,
+      swarm: "wingston",
+      at_ms: 1,
+      summary: "LLM spend spiking — $4.20 in the last 60 min vs a $0.10/window baseline",
+      evidence: %{
+        "window_usd" => "4.20",
+        "baseline_avg_usd" => "0.10",
+        "window_minutes" => 60,
+        "today_usd" => "6.80"
+      },
+      cids: []
+    }
+
+    card = Outbox.alert_card(alert, %{})
+    text = card_text(card)
+
+    assert card["title"] == "📈 wingston: LLM spend spiking"
+    assert text =~ "window_usd 4.20"
+    assert text =~ "💡"
+    assert text =~ "paste to Claude to investigate"
+  end
+
   test "swarm_restarted renders a quiet human card: deploy hint, row count, no investigate tail" do
     alert = %{
       type: :swarm_restarted,
