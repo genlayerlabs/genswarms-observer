@@ -207,12 +207,20 @@ defmodule Genswarms.Observer.OpsDigest do
   defp safe(s) when is_binary(s), do: Digest.sanitize_label(s)
   defp safe(other), do: other |> to_string() |> Digest.sanitize_label()
 
-  # Numbers render as-is; envelope strings (e.g. "$2.39", "66%") are remote
-  # data → sanitized. sanitize_label scrubs 6+ digit runs, which money and
-  # short counts never hit.
+  # Numbers render as-is. Envelope strings are remote data → sanitized —
+  # EXCEPT pure numeric display values ("$8.123456", "66%", "2.387737"):
+  # they carry no PII surface by construction, and the scrubber's
+  # phone/digit-run patterns would eat exactly the money the digest exists
+  # to show.
+  @numericish ~r/^[$€£]?\d[\d,]*(\.\d+)?%?$/
   defp safe_value(v) when is_number(v), do: to_string(v)
   defp safe_value(v) when is_boolean(v), do: to_string(v)
-  defp safe_value(v) when is_binary(v), do: Digest.sanitize_label(v)
+
+  defp safe_value(v) when is_binary(v) do
+    if byte_size(v) <= 24 and Regex.match?(@numericish, v),
+      do: v,
+      else: Digest.sanitize_label(v)
+  end
 
   # ── config validation (fail-closed, called from Scope.init/1) ────────────
 

@@ -177,6 +177,21 @@ defmodule Genswarms.Observer.OpsDigestTest do
     assert text =~ "blocked 3"
   end
 
+  test "numeric display strings survive the scrubber, arbitrary digit strings don't" do
+    env =
+      put_in(
+        envelope(),
+        ["extensions", "audience"],
+        %{"spent" => "$8.123456", "cache" => "66%", "phone" => "+34 600123456"}
+      )
+
+    cfg = config(%{"sections" => [%{"kind" => "block", "block" => "audience"}]})
+    text = text(OpsDigest.plan("wingston", env, cfg, nil, @at_8am))
+    assert text =~ "spent $8.123456"
+    assert text =~ "cache 66%"
+    refute text =~ "600123456"
+  end
+
   test "build! is fail-closed on malformed operator config" do
     assert OpsDigest.build!(nil) == nil
 
