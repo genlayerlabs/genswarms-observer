@@ -6,7 +6,7 @@ defmodule Genswarms.Observer.ConfigSchemaTest do
   @init_keys ~w(swarm_name name registry thresholds cooldown_minutes
                 alert_conversation_id tick_sources read_sources sender
                 escalate_to client client_opts now_fn deliver_fn
-                custom_detectors store_mod save_seq signal_rules)
+                custom_detectors store_mod save_seq signal_rules ops_digest)
 
   defp schema do
     Path.join(__DIR__, "../swarm-object.json")

@@ -1643,4 +1643,125 @@ defmodule Genswarms.Observer.ScopeTest do
       refute Enum.any?(sent(outbox), &(Jason.decode!(&1.content)["card"]["title"] =~ "health_rules_gone"))
     end
   end
+
+  # ── per-tick alert log line ────────────────────────────────────────────────
+
+  describe "alert emission log" do
+    import ExUnit.CaptureLog
+
+    test "an alerting tick logs one line naming the emitted types" do
+      %{state: state} =
+        start_scope(fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}, events: {:error, :x}}})
+
+      log = capture_log(fn -> tick(state) end)
+      assert log =~ "[observer] alerts swarm=wingston sent=endpoint_down:1 suppressed=0"
+    end
+
+    test "a quiet tick logs nothing" do
+      %{state: state} = start_scope()
+
+      log = capture_log(fn -> tick(state) end)
+      refute log =~ "[observer] alerts swarm="
+    end
+  end
+
+  # ── daily ops digest wiring ───────────────────────────────────────────────
+
+  # @t0 is 2025-07-05 17:00 UTC — past the configured hour_utc, so the
+  # digest is due on the very first tick.
+  defp ops_envelope do
+    healthy_dashboard()
+    |> Map.put("extensions", %{"audience" => %{"blocked" => 3, "reachable_dm" => 42}})
+  end
+
+  defp ops_config do
+    %{
+      ops_digest: %{
+        "hour_utc" => 7,
+        "sections" => [%{"kind" => "block", "block" => "audience", "title" => "audience now"}]
+      }
+    }
+  end
+
+  defp ops_cards(outbox) do
+    outbox
+    |> sent()
+    |> Enum.map(&Jason.decode!(&1.content)["card"])
+    |> Enum.filter(&(&1["title"] =~ "🌅"))
+  end
+
+  describe "ops digest" do
+    test "sends one card per day with the configured block section" do
+      %{state: state, clock: clock, outbox: outbox} =
+        start_scope(
+          fixture: %{"wingston" => %{dashboard: {:ok, ops_envelope()}, events: {:ok, []}}},
+          config: ops_config()
+        )
+
+      {_reply, state} = decode_reply(tick(state))
+
+      assert [card] = ops_cards(outbox)
+      assert card["title"] =~ "wingston"
+      assert card["title"] =~ "2025-07-05"
+      assert [%{"text" => text}] = card["blocks"]
+      assert text =~ "audience now"
+      assert text =~ "blocked 3"
+      assert text =~ "reachable_dm 42"
+
+      # same day: no second card
+      advance(clock, 60_000)
+      {_reply, _state} = decode_reply(tick(state))
+      assert length(ops_cards(outbox)) == 1
+    end
+
+    test "a failed delivery is not marked and retries; the next day sends again" do
+      {:ok, failures} = Agent.start_link(fn -> 1 end)
+
+      %{state: state, clock: clock, outbox: outbox} =
+        start_scope(
+          fixture: %{"wingston" => %{dashboard: {:ok, ops_envelope()}, events: {:ok, []}}},
+          config: ops_config()
+        )
+
+      # the FIRST delivery fails, everything after succeeds
+      state = %{
+        state
+        | deliver_fn: fn target, from, content ->
+            if Agent.get_and_update(failures, &{&1, &1 - 1}) > 0 do
+              {:error, :boom}
+            else
+              Agent.update(outbox, &[%{target: target, from: from, content: content} | &1])
+              :ok
+            end
+          end
+      }
+
+      {_reply, state} = decode_reply(tick(state))
+      assert ops_cards(outbox) == []
+
+      # not marked → the next tick retries and succeeds
+      advance(clock, 60_000)
+      {_reply, state} = decode_reply(tick(state))
+      assert length(ops_cards(outbox)) == 1
+
+      # a day later it sends again
+      advance(clock, 24 * 60 * 60_000)
+      {_reply, _state} = decode_reply(tick(state))
+      assert length(ops_cards(outbox)) == 2
+    end
+
+    test "malformed ops_digest config raises at boot (fail-closed operator config)" do
+      assert_raise ArgumentError, fn ->
+        start_scope(config: %{ops_digest: %{"sections" => [%{"kind" => "nope"}]}})
+      end
+    end
+
+    test "without ops_digest config nothing changes" do
+      %{state: state, outbox: outbox} =
+        start_scope(fixture: %{"wingston" => %{dashboard: {:ok, ops_envelope()}, events: {:ok, []}}})
+
+      {_reply, _state} = decode_reply(tick(state))
+      assert ops_cards(outbox) == []
+    end
+  end
 end

@@ -13,6 +13,7 @@
 #   OBSERVER_ALERT_CONVERSATION_ID  destination chat for alert cards
 #   OBSERVER_COOLDOWN_MINUTES       per (swarm, type) anti-storm (default 30)
 #   OBSERVER_TELEGRAM_DRY_RUN       "1" -> sender records but never hits Telegram
+#   OBSERVER_OPS_DIGEST_JSON        daily ops digest config as JSON (unset -> off)
 #   OBSERVER_SMOKE                  "1" -> fakes from :persistent_term (boot smoke)
 #   UNHARDCODED_CONSUMER_KEY        router consumer key; unset -> :diagnostico
 #                                   degrades to :mock
@@ -42,6 +43,15 @@ signal_rules =
     json when is_binary(json) and json != "" -> Jason.decode!(json)
     _ -> []
   end
+
+# Daily ops digest (fail-CLOSED at boot — see Scope's `ops_digest` config).
+# Same JSON-env pattern: a map with hour_utc + sections; unset -> off.
+ops_digest =
+  case System.get_env("OBSERVER_OPS_DIGEST_JSON") do
+    json when is_binary(json) and json != "" -> Jason.decode!(json)
+    _ -> nil
+  end
+
 smoke? = System.get_env("OBSERVER_SMOKE") == "1"
 
 if (System.get_env("OBSERVER_TELEGRAM_BOT_TOKEN") || "") == "" do
@@ -151,7 +161,8 @@ diagnostico =
             read_sources: ["diagnostico"],
             sender: :sender,
             escalate_to: :diagnostico,
-            signal_rules: signal_rules
+            signal_rules: signal_rules,
+            ops_digest: ops_digest
           },
           Map.new(scope_client)
         )

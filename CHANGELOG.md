@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- LLM spend burn-rate detector: new builtin
+  `Genswarms.Observer.Detectors.LlmSpend` samples the envelope's cumulative
+  daily spend (default `extensions.llm_proxy_budget.spent_usd`, retarget
+  via `llm_spend.path`) and raises `:llm_spend_spike` (investigable) when
+  the last `llm_spend.window_s` costs ≥ `llm_spend.factor` × the swarm's
+  own trailing per-window baseline and ≥ `llm_spend.min_usd` — catches a
+  runaway loop while it's still cheap, complementing the llm-proxy
+  package's 75%/90%-of-ceiling rules. Reset-aware across midnight
+  rollovers; silent during warm-up (`llm_spend.min_baseline_windows`).
+- Daily ops digest: new boot-only `ops_digest` config
+  (`OBSERVER_OPS_DIGEST_JSON`) renders one card per swarm per day at/after
+  `hour_utc` straight from the envelope — `"block"` sections read scalar
+  extension keys, `"page_row"` sections read one row of a
+  `dashboard_pages` table (`latest_closed` = yesterday's durable final).
+  Mark-after-send per swarm (persisted via `store_mod`), fail-closed
+  config validation at boot, remote strings sanitized like topic labels.
+- Recovery hint on restart-dropped users: new per-swarm registry key
+  `recover_hint` — a restart-correlated `unanswered` card now renders the
+  operator's template with `{cid}` substituted (e.g. `/reach {cid} …`), so
+  the users whose replies died with the old pod can be reached from the
+  card itself.
+- Observability of the observer: each alerting tick logs
+  `[observer] alerts swarm=<name> sent=<type:count,...> suppressed=<n>`
+  and each ops digest delivery logs its day — the send history
+  reconstructs from the log alone (it used to say only "sender received
+  message from scope").
 - POSITIVE restart detection: new builtin detector
   `Genswarms.Observer.Detectors.Restarted` consumes the host's
   `feed_rehydrated` display event (emitted exactly once per pod boot by the
