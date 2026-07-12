@@ -229,6 +229,11 @@ operand behind a separate `"where"`.
   (`:diagnostico` runs with `network: :isolated` — nothing but the LLM
   router forwarder).
 - Tokens as env var **names** (`token_env`) — never literals.
+- Registry keys are the observer-side IDENTITY (alert titles, dedupe, MCP
+  addressing); the wire name defaults to the key and is overridden per
+  entry with `name` when the observed backend answers to something else
+  (two deployments of one swarm: key `wingston-prod`, wire name
+  `wingston`).
 - `registry` and `thresholds` are `x-mutable` (hot-patch from the
   configurator); allowlists (`tick_sources`, `read_sources`,
   `escalate_to`) are NOT.

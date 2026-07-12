@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Registry wire-name override: entry key `name` — the swarm name the
+  observed BACKEND answers to, when it differs from the registry key
+  (key `wingston-prod`, wire name `wingston`: two deployments of one swarm
+  need distinct keys but each backend only knows its own name). All fetch
+  paths (dashboard/events/feed/session history) go through
+  `Ingest.wire_name/2`; the registry key stays the observer-side identity
+  (alert titles, dedupe, relay eligibility). Until now the key doubled as
+  the wire name and `normalize_entry` silently DROPPED `name` — a
+  prod entry keyed by an alias fetched a wrong-name dashboard URL, which
+  tolerant backends answered with a stub envelope (dashboard-based
+  detectors, signals and digests silently blind) and strict backends
+  (genswarms-dashboard ≥ 0.3.8) answer with 404 (`endpoint_down` noise).
 - LLM spend burn-rate detector: new builtin
   `Genswarms.Observer.Detectors.LlmSpend` samples the envelope's cumulative
   daily spend (default `extensions.llm_proxy_budget.spent_usd`, retarget

@@ -91,4 +91,39 @@ defmodule Genswarms.Observer.IngestTest do
     assert {:error, :flake} = data.feed
     assert proposed == nil
   end
+  # ── wire-name override (registry key ≠ backend name) ──────────────────────
+
+  test "entry \"name\" overrides the wire name for all three reads" do
+    {:ok, fake} =
+      Client.Fake.start_link(%{
+        "wingston" => %{
+          dashboard: {:ok, %{"swarm" => "wingston"}},
+          events: {:ok, []},
+          events_feed: {:ok, %{events: [], seq: 0}}
+        }
+      })
+
+    entry = Map.put(@entry, "name", "wingston")
+
+    {data, _proposed} = Ingest.fetch(Client.Fake, [fake: fake], "wingston-prod", entry, nil, 10)
+
+    # the fixture only answers to the WIRE name — a fetch under the registry
+    # key would read {:error, :not_configured} on every surface
+    assert {:ok, %{"swarm" => "wingston"}} = data.dashboard
+    assert {:ok, []} = data.events
+    assert {:ok, []} = data.feed
+
+    assert Enum.all?(Client.Fake.calls(fake), &(&1.swarm == "wingston"))
+  end
+
+  test "without the override the registry key IS the wire name (unchanged behavior)" do
+    fake = fake_with({:ok, %{events: [], seq: 0}})
+
+    {data, _} = Ingest.fetch(Client.Fake, [fake: fake], "wingston", @entry, nil, 10)
+    assert {:ok, _} = data.dashboard
+
+    assert Ingest.wire_name(@entry, "wingston") == "wingston"
+    assert Ingest.wire_name(Map.put(@entry, "name", ""), "wingston") == "wingston"
+    assert Ingest.wire_name(Map.put(@entry, "name", nil), "wingston") == "wingston"
+  end
 end

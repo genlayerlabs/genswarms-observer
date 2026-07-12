@@ -1764,4 +1764,54 @@ defmodule Genswarms.Observer.ScopeTest do
       assert ops_cards(outbox) == []
     end
   end
+
+  # ── wire-name override end to end ─────────────────────────────────────────
+
+  describe "registry wire name" do
+    test "fetches under the entry name; alerts keep the registry-key identity" do
+      # fixture answers ONLY to the wire name "wingston"
+      {:ok, fake} = Client.Fake.start_link(%{"wingston" => healthy_fixture()})
+      {:ok, clock} = Agent.start_link(fn -> @t0 end)
+      {:ok, outbox} = Agent.start_link(fn -> [] end)
+
+      config = %{
+        swarm_name: "observer",
+        registry: %{
+          "wingston-prod" => %{
+            dashboard_url: "http://elb.example",
+            token_env: nil,
+            repo: "o/r",
+            name: "wingston"
+          }
+        },
+        tick_sources: ["cron"],
+        read_sources: ["diagnostico"],
+        alert_conversation_id: "tg:42:0",
+        client: Client.Fake,
+        client_opts: [fake: fake],
+        store_mod: NullStore,
+        now_fn: fn -> Agent.get(clock, & &1) end,
+        deliver_fn: fn target, from, content ->
+          Agent.update(outbox, &[%{target: target, from: from, content: content} | &1])
+          :ok
+        end
+      }
+
+      {:ok, state} = Scope.init(config)
+
+      # healthy tick: the wire fetch resolved (no endpoint_down card), and
+      # every client call went out under the wire name
+      {reply, state} = decode_reply(tick(state))
+      assert reply["alerts"] == 0
+      assert Enum.all?(Client.Fake.calls(fake), &(&1.swarm == "wingston"))
+
+      # break the endpoint: the alert carries the REGISTRY KEY identity
+      Client.Fake.put(fake, "wingston", %{dashboard: {:error, :econnrefused}, events: {:error, :x}})
+      advance(clock, 1_000)
+      {_reply, _state} = decode_reply(tick(state))
+
+      [card] = sent(outbox) |> Enum.map(&Jason.decode!(&1.content)["card"])
+      assert card["title"] =~ "wingston-prod"
+    end
+  end
 end

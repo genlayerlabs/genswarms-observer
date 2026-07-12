@@ -22,6 +22,7 @@
             "dashboard_url": { "type": "string", "description": "Dashboard backend base URL (e.g. http://127.0.0.1:4994)." },
             "token_env": { "type": "string", "description": "Env var NAME holding the dashboard bearer token; omit for loopback dashboards." },
             "repo": { "type": "string", "description": "GitHub org/repo of the observed swarm, linked in alert cards." },
+            "name": { "type": "string", "description": "Wire-name override: the swarm name the observed backend answers to, when it differs from the registry key (e.g. key wingston-prod, wire name wingston). Omit when the key IS the wire name. The registry key stays the observer-side identity (alert titles, dedupe, MCP addressing)." },
             "recover_hint": { "type": "string", "description": "Operator-authored recovery template rendered on restart-correlated unanswered cards, with {cid} replaced by the waiting user's cid (e.g. \"/reach {cid} <note> from the operator chat\"). Omit for no recovery line." }
           }
         }

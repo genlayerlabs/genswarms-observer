@@ -1344,7 +1344,12 @@ defmodule Genswarms.Observer.Objects.Scope do
         token = Ingest.resolve_token(entry)
         fun = if kind == :dashboard, do: :get_dashboard, else: :get_events
 
-        case safe_client(state, fun, [entry["dashboard_url"], to_string(swarm), token, state.client_opts]) do
+        case safe_client(state, fun, [
+               entry["dashboard_url"],
+               Ingest.wire_name(entry, swarm),
+               token,
+               state.client_opts
+             ]) do
           {:ok, result} when kind == :dashboard ->
             {:reply, Jason.encode!(%{ok: true, dashboard: result}), state}
 
@@ -1430,7 +1435,7 @@ defmodule Genswarms.Observer.Objects.Scope do
     {reply, spent} =
       case safe_client(state, :get_session_history, [
              entry["dashboard_url"],
-             swarm,
+             Ingest.wire_name(entry, swarm),
              cid,
              token,
              state.client_opts
@@ -1524,6 +1529,12 @@ defmodule Genswarms.Observer.Objects.Scope do
       "dashboard_url" => entry_get(entry, :dashboard_url),
       "token_env" => entry_get(entry, :token_env),
       "repo" => entry_get(entry, :repo),
+      # Wire-name override: the name the observed backend answers to, when
+      # it differs from the registry key (two deployments of one swarm need
+      # distinct keys but the same wire name). All fetch paths go through
+      # Ingest.wire_name/2; the registry KEY stays the observer-side
+      # identity everywhere (alert titles, dedupe, relay eligibility).
+      "name" => entry_get(entry, :name),
       # Operator-authored recovery template for restart-dropped users —
       # "{cid}" is replaced with the waiting user's cid on the card (see
       # Outbox.alert_card). Config-owned so the package never names a
@@ -1533,7 +1544,13 @@ defmodule Genswarms.Observer.Objects.Scope do
   end
 
   defp normalize_entry(_),
-    do: %{"dashboard_url" => nil, "token_env" => nil, "repo" => nil, "recover_hint" => nil}
+    do: %{
+      "dashboard_url" => nil,
+      "token_env" => nil,
+      "repo" => nil,
+      "name" => nil,
+      "recover_hint" => nil
+    }
 
   defp entry_get(entry, key),
     do: Map.get(entry, key, Map.get(entry, to_string(key)))
