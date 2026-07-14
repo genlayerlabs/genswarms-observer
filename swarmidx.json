@@ -7,9 +7,9 @@
       "name": "genswarms-observer",
       "dir": ".",
       "kind": "handler",
-      "description": "Observer scope object: deterministic health detectors (stall, error_burst, budget_block, endpoint_down, pool_saturated) over other swarms' dashboards, with cooldown-deduped Telegram alert cards",
+      "description": "Observer scope object: durable deterministic detectors and declarative health rules over other swarms' dashboards, with cooldown-deduped Telegram alerts, daily ops digests, and diagnosis escalation",
       "module": "Genswarms.Observer.Objects.Scope",
-      "note": "kind:handler for v0.2 (the :scope object). The full kind:swarm packaging (cron+scope+sender IR) lands when the diagnosis agent (fase 3) matures."
+      "note": "kind:handler publishes the :scope object. Hosts compose cron, sender, and the optional isolated diagnosis agent with observer.swarm.exs."
     }
   ]
 }

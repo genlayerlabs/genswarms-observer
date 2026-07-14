@@ -4,10 +4,11 @@ defmodule GenswarmsObserver.MixProject do
   def project do
     [
       app: :genswarms_observer,
-      version: "0.2.0",
+      version: "0.3.0",
       elixir: "~> 1.14",
       elixirc_paths: ["lib"],
-      description: "Observer swarm: deterministic health detectors over other genswarms' dashboards",
+      description:
+        "Observer swarm: deterministic health detectors over other genswarms' dashboards",
       package: package(),
       source_url: "https://github.com/genlayerlabs/genswarms-observer",
       start_permanent: Mix.env() == :prod,

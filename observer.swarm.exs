@@ -1,4 +1,4 @@
-# observer — the swarm that watches swarms (v0.2: cron -> scope -> sender).
+# observer — the swarm that watches swarms (v0.3: cron -> scope -> sender + diagnosis).
 #
 # Detection is deterministic (Genswarms.Observer.Detectors); the LLM only
 # enters at fase 3 (:diagnostico). The only node that opens sockets is

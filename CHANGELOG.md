@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.3.0 — 2026-07-14
+
 - Registry wire-name override: entry key `name` — the swarm name the
   observed BACKEND answers to, when it differs from the registry key
   (key `wingston-prod`, wire name `wingston`: two deployments of one swarm
