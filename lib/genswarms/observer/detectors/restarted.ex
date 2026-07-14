@@ -10,8 +10,8 @@ defmodule Genswarms.Observer.Detectors.Restarted do
   unreachability blips (`endpoint_down` + "swarm_not_found", the
   restart-*shaped* alert) — a fast rollout between two ticks was invisible,
   and the `unanswered` correlation ("their reply died with the old pod")
-  missed exactly those. Hosts whose feed never carries the kind (micromarkets
-  synthesizes its feed from the log store) simply never fire it.
+  missed exactly those. Hosts whose feed never carries the kind simply never
+  fire it.
 
   Two alerts:
 
@@ -30,8 +30,10 @@ defmodule Genswarms.Observer.Detectors.Restarted do
   STATEFUL, same discipline as `DeliveryFailureBurst`: the feed is
   incremental per session but `det` state is PERSISTED while the cursor is
   not, so an observer restart replays the host's ring — entries are deduped
-  by the wire's `seq` (ts fallback) and pruned to the loop window, or a
-  single real boot would re-alert on every observer restart.
+  by the wire's `{seq, ts}` identity (ts-only fallback) and pruned to the loop
+  window, or a single real boot would re-alert on every observer restart. The
+  timestamp is part of the identity because a host feed may restart its cursor
+  and reuse the same sequence number on a later real boot.
 
   `feed` `:unavailable` / `{:error, _}` / absent is a no-op with prior state.
   """
@@ -145,7 +147,7 @@ defmodule Genswarms.Observer.Detectors.Restarted do
     end)
   end
 
-  defp dedupe_key(%{"seq" => seq}, _ms) when is_integer(seq), do: {:seq, seq}
+  defp dedupe_key(%{"seq" => seq}, ms) when is_integer(seq), do: {:seq, seq, ms}
   defp dedupe_key(_ev, ms), do: {:ts, ms}
 
   defp prune(state, now_ms, window_ms),

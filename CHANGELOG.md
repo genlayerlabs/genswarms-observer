@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.3.0 — 2026-07-14
+
 - Registry wire-name override: entry key `name` — the swarm name the
   observed BACKEND answers to, when it differs from the registry key
   (key `wingston-prod`, wire name `wingston`: two deployments of one swarm
@@ -50,12 +52,12 @@
   escalates to `:restart_loop` (investigable) at `>= restart.loop_count`
   boots within `restart.loop_window_s`. Fresh-window gating
   (`restart.fresh_window_s`) keeps ring replays of old boots (newly
-  registered swarms, observer restarts) silent; state is seq-deduped and
-  pruned, same discipline as `DeliveryFailureBurst`. The `unanswered`
+  registered swarms, observer restarts) silent; state is `{seq, ts}`-deduped
+  (a restarted host may reuse a feed sequence) and pruned, same discipline as
+  `DeliveryFailureBurst`. The `unanswered`
   correlation ("their reply died with the old pod") now also matches the
   positive detection, not just the endpoint_down inference. Hosts whose
-  feed never carries `feed_rehydrated` (micromarkets synthesizes from the
-  log store) simply never fire it.
+  feed never carries `feed_rehydrated` simply never fire it.
 - Fase 3 v1: `:diagnostico` bwrap body with isolated network (Σ_pol routing
   to the unhardcoded router, router-driven auto-compaction) + alert
   escalation from `:scope` as diagnosis tasks. Requires engine ≥ #79 for the

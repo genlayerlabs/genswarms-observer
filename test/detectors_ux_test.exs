@@ -1090,8 +1090,19 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       {[_alert], state} = Restarted.detect(fetched(events), restart_ctx(nil, 60_000))
 
-      # same events replayed against the persisted state → seq-deduped, silent
+      # same events replayed against the persisted state → identity-deduped, silent
       assert {[], ^state} = Restarted.detect(fetched(events), restart_ctx(state, 120_000))
+    end
+
+    test "a later host boot may reuse the same feed sequence without being suppressed" do
+      first = boot_ev(0, %{"seq" => 77})
+      second = boot_ev(600_000, %{"seq" => 77})
+
+      {[_], s1} = Restarted.detect(fetched([first]), restart_ctx(nil, 60_000))
+      {[_], s2} = Restarted.detect(fetched([second]), restart_ctx(s1, 660_000))
+
+      assert length(s2.seen) == 2
+      assert {[], ^s2} = Restarted.detect(fetched([second]), restart_ctx(s2, 720_000))
     end
 
     test "boots at/over the loop threshold raise :restart_loop alongside :swarm_restarted" do

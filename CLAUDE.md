@@ -1,8 +1,10 @@
 # genswarms-observer — working notes
 
 State: **v0.2.0 published** (`swarmidx:genlayerlabs/genswarms-observer@0.2.0`,
-log #54) and **fase 3 v1 shipped on main** (isolated bwrap `:diagnostico` +
-alert escalation). Everything here runs live against real swarms via the
+log #54) and **v0.3.0 prepared for release** (durable detector state,
+declarative health rules, human alert cards, positive restart detection,
+daily ops digests, spend-rate alerts, and isolated bwrap `:diagnostico`
+escalation). Everything here runs live against real swarms via the
 `genswarms-fleet` MCP.
 
 ## Architecture
