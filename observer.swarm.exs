@@ -156,6 +156,15 @@ diagnostico =
             thresholds: %{},
             cooldown_minutes:
               String.to_integer(System.get_env("OBSERVER_COOLDOWN_MINUTES") || "30"),
+            # Prod defaults sized by the 2026-07-18 incident: the wingston
+            # snapshot is ~800KB/2s at IDLE, so 5s http + 2s detector walls
+            # false-alarmed under evening load. Package defaults stay tighter.
+            http_timeout_ms:
+              String.to_integer(System.get_env("OBSERVER_HTTP_TIMEOUT_MS") || "15000"),
+            detector_timeout_ms:
+              String.to_integer(System.get_env("OBSERVER_DETECTOR_TIMEOUT_MS") || "5000"),
+            gap_alert_minutes:
+              String.to_integer(System.get_env("OBSERVER_GAP_ALERT_MINUTES") || "30"),
             alert_conversation_id: System.get_env("OBSERVER_ALERT_CONVERSATION_ID"),
             tick_sources: ["cron"],
             read_sources: ["diagnostico"],

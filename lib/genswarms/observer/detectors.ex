@@ -64,11 +64,27 @@ defmodule Genswarms.Observer.Detectors do
     det_state = det_state || initial_state()
 
     case data do
-      %{dashboard: {:error, reason}} ->
+      %{dashboard: {:error, reason}} = data ->
+        # Triage before crying wolf: the same tick already fetched the cheap
+        # /events surface. If THAT answered, the swarm is alive and only the
+        # dashboard snapshot is failing (slow under load, oversized payload)
+        # — a different incident than a dead pod, with a different response.
         alert =
-          alert(:endpoint_down, swarm, now_ms, "dashboard fetch failed: #{inspect(reason)}", %{
-            "reason" => inspect(reason)
-          })
+          case data do
+            %{events: {:ok, evs}} when is_list(evs) ->
+              alert(
+                :dashboard_slow,
+                swarm,
+                now_ms,
+                "dashboard fetch failed (#{inspect(reason)}) but the swarm is alive — events endpoint answered",
+                %{"reason" => inspect(reason)}
+              )
+
+            _ ->
+              alert(:endpoint_down, swarm, now_ms, "dashboard fetch failed: #{inspect(reason)}", %{
+                "reason" => inspect(reason)
+              })
+          end
 
         # No dashboard -> nothing else is observable; reset sustained counters
         # so a recovering swarm doesn't instantly fire pool_saturated.

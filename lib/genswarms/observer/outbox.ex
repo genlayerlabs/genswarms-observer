@@ -67,6 +67,13 @@ defmodule Genswarms.Observer.Outbox do
       else: "🔌 #{swarm}: dashboard unreachable"
   end
 
+  defp title_for(%{type: :dashboard_slow, swarm: swarm}),
+    do: "🐢 #{swarm}: dashboard slow — swarm alive"
+
+  defp title_for(%{type: :observer_gap}) do
+    "🌙 observer: I was blind for a while"
+  end
+
   # POSITIVE restart (Detectors.Restarted, feed_rehydrated) — vs the
   # restart-SHAPED endpoint_down inference above.
   defp title_for(%{type: :swarm_restarted, swarm: swarm} = alert) do
@@ -161,6 +168,28 @@ defmodule Genswarms.Observer.Outbox do
     if restart_shaped?(alert) do
       "The fleet API doesn't know the swarm right now — almost always a deploy rolling out or the pod rebooting. If no deploy was expected, treat this as real and check the pod."
     end
+  end
+
+  defp body_for(%{type: :dashboard_slow}, _recent, _entry) do
+    "The dashboard snapshot timed out, but the events endpoint answered — the swarm is alive; " <>
+      "only the (heavy) snapshot is failing, usually under load. Users are likely fine. " <>
+      "If this repeats, the snapshot needs a diet or the observer timeout a raise."
+  end
+
+  defp body_for(%{type: :observer_gap} = alert, _recent, _entry) do
+    ev = alert.evidence || %{}
+    mins = Map.get(ev, "gap_minutes")
+
+    dur =
+      if is_integer(mins) do
+        "#{div(mins, 60)} h #{rem(mins, 60)} m"
+      else
+        "a while"
+      end
+
+    "No tick ran for #{dur} — the machine running me was probably asleep or off. " <>
+      "Anything that happened in that window alerted late or not at all; " <>
+      "the backlog below this message is catching up, not breaking news."
   end
 
   defp body_for(%{type: :swarm_restarted} = alert, _recent, _entry) do
@@ -262,7 +291,9 @@ defmodule Genswarms.Observer.Outbox do
   def explain(:detector_crashed), do: "A detector crashed or timed out; inspect detector health and restart or patch the failing detector."
   def explain(:detector_invalid), do: "A detector returned malformed alerts; inspect the named module and fix its alert shape."
   def explain(:detector_quarantined), do: "A detector failed repeatedly and was disabled for this swarm; restart the observer after fixing it."
+  def explain(:dashboard_slow), do: "The dashboard snapshot failed while the events endpoint answered; the swarm is alive — check snapshot latency/size and the observer's http timeout."
   def explain(:endpoint_down), do: "The dashboard endpoint could not be fetched; verify the swarm process, URL, network path, and token."
+  def explain(:observer_gap), do: "The observer itself missed ticks (host asleep or stopped); alerts after the gap are backlog, and anything during it went unobserved."
   def explain(:error_burst), do: "Recent error events crossed the burst threshold; inspect the event sample and latest dashboard state."
   def explain(:health_rule), do: "A declarative health rule fired; inspect the named extension block and rule id in the evidence."
   def explain(:health_rules_gone), do: "A package block stopped publishing health_rules; check for component downtime or a dashboard regression."
