@@ -39,7 +39,7 @@ defmodule Genswarms.Observer.Outbox do
   # `recent` (the emitter's kept-alerts list) powers correlation: an unanswered
   # request minutes after an endpoint_down says "restart", not just "no reply".
   @recent_restart_window_ms 15 * 60_000
-  @investigable ~w(unanswered error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback restart_loop llm_spend_spike)a
+  @investigable ~w(unanswered budget_block_wave error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback restart_loop llm_spend_spike)a
 
   def alert_card(alert, entry, recent \\ [])
 
@@ -83,6 +83,14 @@ defmodule Genswarms.Observer.Outbox do
 
   defp title_for(%{type: :budget_block, swarm: swarm}), do: "💸 #{swarm}: LLM budget block"
 
+  defp title_for(%{type: :budget_block_wave, swarm: swarm} = alert) do
+    count = Map.get(alert.evidence || %{}, "count")
+    n = if is_integer(count), do: count, else: "several"
+    reasons = Map.get(alert.evidence || %{}, "reasons") || []
+    cause = if reasons == [], do: "LLM limits", else: Enum.join(reasons, "/")
+    "⏳ #{swarm}: #{n} conversations blocked by #{cause} limits"
+  end
+
   defp title_for(%{type: :llm_spend_spike, swarm: swarm}),
     do: "📈 #{swarm}: LLM spend spiking"
   defp title_for(%{type: :error_burst, swarm: swarm}), do: "🔥 #{swarm}: error burst"
@@ -95,6 +103,37 @@ defmodule Genswarms.Observer.Outbox do
   defp title_for(alert), do: "⚠️ observer: #{alert.swarm} · #{alert.type}"
 
   # Custom human bodies — nil falls back to alert.summary + the 💡 explanation.
+
+  # A budget-blocked unanswered user is NOT waiting for a fresh agent — their
+  # next message hits the same block until the UTC reset. Say the truth.
+  defp body_for(%{type: :unanswered, evidence: %{"blocked_reason" => reason}} = alert, _r, _e)
+       when is_binary(reason) do
+    waited = Map.get(alert.evidence || %{}, "waited_minutes")
+    mins = if is_integer(waited), do: "#{waited} min", else: "a while"
+
+    "They wrote #{mins} ago and their conversation hit its #{reason} LLM limit — " <>
+      "writing again won't help until the limit resets at 00:00 UTC. " <>
+      "Paste this to Claude to dig in, or consider the limit config if this keeps happening."
+  end
+
+  defp body_for(%{type: :budget_block_wave} = alert, _recent, _entry) do
+    ev = alert.evidence || %{}
+    count = Map.get(ev, "count")
+    n = if is_integer(count), do: count, else: "Several"
+    oldest = Map.get(ev, "oldest_waited_minutes")
+    oldest_line = if is_integer(oldest), do: " Oldest has waited #{oldest} min.", else: ""
+
+    cids =
+      case Map.get(ev, "cids") do
+        list when is_list(list) and list != [] -> "\nAffected: " <> Enum.join(list, " · ")
+        _ -> ""
+      end
+
+    "#{n} conversations wrote and got no reply because they exhausted their daily LLM limits — " <>
+      "this is one incident, not #{n} separate ones. They all recover at 00:00 UTC when limits reset; " <>
+      "until then their messages are blocked.#{oldest_line}#{cids}"
+  end
+
   defp body_for(%{type: :unanswered} = alert, recent, entry) do
     waited = Map.get(alert.evidence || %{}, "waited_minutes")
     mins = if is_integer(waited), do: "#{waited} min", else: "a while"
@@ -218,6 +257,7 @@ defmodule Genswarms.Observer.Outbox do
 
   def explain(:alerts_coalesced), do: "Too many alerts fired in one tick; inspect the evidence counts for dropped alert types."
   def explain(:budget_block), do: "The observed swarm saw an LLM budget block; check quota, budget configuration, and dependent agents."
+  def explain(:budget_block_wave), do: "Multiple unanswered conversations hit their daily LLM limits at once; they recover at the 00:00 UTC reset — review the limit config if waves recur."
   def explain(:delivery_failure_burst), do: "A conversation is repeatedly failing delivery; inspect the cid transcript and Telegram sender errors."
   def explain(:detector_crashed), do: "A detector crashed or timed out; inspect detector health and restart or patch the failing detector."
   def explain(:detector_invalid), do: "A detector returned malformed alerts; inspect the named module and fix its alert shape."

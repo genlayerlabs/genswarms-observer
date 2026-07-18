@@ -95,6 +95,34 @@ defmodule Genswarms.Observer.RelayTest do
              status(state)["relay_log"]
   end
 
+  test "allowed: a budget_block_wave alert makes every collapsed cid relay-eligible" do
+    %{state: state} =
+      start_scope(
+        fixture: %{
+          "wingston" => %{
+            session_history: %{"tg:2:0" => {:ok, %{"turns" => [%{"role" => "user", "text" => "hola"}]}}}
+          }
+        }
+      )
+
+    wave =
+      alert(%{
+        type: :budget_block_wave,
+        key: {"wingston", :budget_block_wave},
+        cids: ["tg:1:0", "tg:2:0", "tg:3:0"],
+        summary: "3 conversations unanswered and LLM-blocked (budget)",
+        source: Genswarms.Observer.Detectors.Unanswered
+      })
+
+    state = %{state | alerts: [wave]}
+
+    {:reply, json, _state} = ask(state, "wingston", "tg:2:0")
+    reply = Jason.decode!(json)
+
+    assert reply["ok"] == true
+    assert reply["history"]["turns"] == [%{"role" => "user", "text" => "hola"}]
+  end
+
   # ── denials ──────────────────────────────────────────────────────────────
 
   test "denied: unknown swarm" do

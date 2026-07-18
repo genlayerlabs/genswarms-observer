@@ -50,6 +50,51 @@ defmodule Genswarms.Observer.OutboxTest do
     assert text =~ "wingston-prod"
   end
 
+  test "budget_block_wave renders one human card naming count, cause and cids" do
+    alert = %{
+      type: :budget_block_wave,
+      swarm: "wingston-prod",
+      at_ms: 1_784_355_000_000,
+      summary: "3 conversations unanswered and LLM-blocked (budget) — oldest waiting 45 min",
+      evidence: %{
+        "count" => 3,
+        "cids" => ["tg:1:0", "tg:2:0", "tg:3:0"],
+        "reasons" => ["budget"],
+        "oldest_waited_minutes" => 45
+      },
+      cids: ["tg:1:0", "tg:2:0", "tg:3:0"]
+    }
+
+    card = Outbox.alert_card(alert, %{"repo" => "x/y"})
+    text = card_text(card)
+
+    assert card["title"] =~ "3"
+    assert card["title"] =~ "budget"
+    # human body says users recover at the UTC reset, not a generic hint
+    assert text =~ "00:00 UTC"
+    assert text =~ "tg:2:0"
+    refute text =~ "{\""
+  end
+
+  test "an unanswered alert with a blocked cause says the cause, not the generic line" do
+    alert = %{
+      type: :unanswered,
+      swarm: "wingston-prod",
+      at_ms: 1_784_355_000_000,
+      summary: "request tg:7:0 unanswered for 20 min — LLM blocked (budget)",
+      evidence: %{
+        "opened_at_ms" => 1_784_353_800_000,
+        "waited_minutes" => 20,
+        "blocked_reason" => "budget"
+      },
+      cids: ["tg:7:0"]
+    }
+
+    text = Outbox.alert_card(alert, %{}) |> card_text()
+    assert text =~ "budget"
+    refute text =~ "fresh agent"
+  end
+
   test "an unanswered alert right after a restart says so (correlation)" do
     restart = %{
       type: :endpoint_down,

@@ -132,6 +132,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   # ran, stamped onto the alert by the runner itself).
   @builtin_relay_types MapSet.new([
                          :unanswered,
+                         :budget_block_wave,
                          :delivery_failure_burst,
                          :stall,
                          :error_burst,

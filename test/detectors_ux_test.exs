@@ -162,7 +162,7 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       # applied only once the alert actually emits (see the F4 describe
       # block below). Simulate the emission here so this dedupe test still
       # exercises the "already alerted" path on tick 2.
-      assert state1["tg:1:0"] == %{opened_ms: 0, alerted: false}
+      assert state1["tg:1:0"] == %{opened_ms: 0, alerted: false, blocked: nil}
       state1 = Unanswered.on_emitted(state1, hd(alerts1))
 
       # Next tick's fetch still returns the same request_open (feed window
@@ -203,8 +203,11 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       assert [%{type: :unanswered, cids: ["tg:1:0"]}] = alerts
     end
 
-    test "default_thresholds exposes only its namespaced key" do
-      assert Unanswered.default_thresholds() == %{"unanswered.minutes" => 15}
+    test "default_thresholds exposes only its namespaced keys" do
+      assert Unanswered.default_thresholds() == %{
+               "unanswered.minutes" => 15,
+               "unanswered.wave_min" => 2
+             }
     end
 
     test "pruning evicts an alerted cid whose opened_ms is more than 24h stale" do
@@ -240,7 +243,8 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       {alerts, new_state} = Unanswered.detect(fetched([]), ctx)
 
       assert alerts == []
-      assert new_state == state
+      # normalize upgrades pre-cause-attribution entries with blocked: nil
+      assert new_state == %{"tg:1:0" => %{opened_ms: opened_ms, alerted: true, blocked: nil}}
     end
 
     test "an unalerted old cid is NOT evicted (it may still legitimately alert)" do
@@ -260,7 +264,7 @@ defmodule Genswarms.Observer.DetectorsUxTest do
       {alerts, new_state} = Unanswered.detect(fetched([]), ctx)
 
       assert alerts == []
-      assert new_state == state
+      assert new_state == %{"tg:1:0" => %{opened_ms: opened_ms, alerted: false, blocked: nil}}
     end
 
     test "malformed ts on request_open is skipped; a later valid open for the same cid tracks normally" do
@@ -478,6 +482,176 @@ defmodule Genswarms.Observer.DetectorsUxTest do
 
       assert is_map(state)
       assert Map.has_key?(state, "tg:1:0")
+    end
+  end
+
+  describe "Unanswered — budget-block cause attribution" do
+    test "llm_proxy_block on a tracked cid attributes the cause in the alert" do
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          ev("llm_proxy_block", "tg:1:0", 30_000, %{"reason" => "budget"})
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      {[alert], _state} = Unanswered.detect(f, ctx0)
+
+      assert alert.type == :unanswered
+      assert alert.key == {"w", :unanswered, "tg:1:0"}
+      assert alert.evidence["blocked_reason"] == "budget"
+      assert alert.summary =~ "budget"
+    end
+
+    test "llm_proxy_block for an untracked cid is ignored (background sessions)" do
+      # A summarizer block has no pending user request — no open, no alert.
+      f = fetched([ev("llm_proxy_block", "tg:9:0", 0, %{"reason" => "budget"})])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], state} = Unanswered.detect(f, ctx0)
+      refute Map.has_key?(state, "tg:9:0")
+    end
+
+    test "ok reply still clears a blocked cid" do
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          ev("llm_proxy_block", "tg:1:0", 30_000, %{"reason" => "budget"}),
+          ev("reply_sent", "tg:1:0", 60_000, %{"ok" => true})
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      assert {[], %{}} = Unanswered.detect(f, ctx0)
+    end
+
+    test "old persisted state shape (no :blocked) is upgraded, not dropped" do
+      ctx = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: %{"tg:5:0" => %{opened_ms: 1_000, alerted: false}},
+        now_ms: 1_000 + 20 * 60_000
+      }
+
+      assert {[%{type: :unanswered}], state} = Unanswered.detect(%{feed: {:ok, []}}, ctx)
+      assert Map.has_key?(state, "tg:5:0")
+    end
+  end
+
+  describe "Unanswered — budget-block wave aggregation" do
+    test "two or more blocked overdue cids collapse into ONE wave alert" do
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          ev("llm_proxy_block", "tg:1:0", 10_000, %{"reason" => "budget"}),
+          ev("request_open", "tg:2:0", 20_000),
+          ev("llm_proxy_block", "tg:2:0", 30_000, %{"reason" => "budget"}),
+          # a plain (unblocked) unanswered cid keeps its individual alert
+          ev("request_open", "tg:3:0", 40_000)
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 40_000 + 16 * 60_000
+      }
+
+      {alerts, _state} = Unanswered.detect(f, ctx0)
+
+      wave = Enum.find(alerts, &(&1.type == :budget_block_wave))
+      assert wave, "expected a :budget_block_wave alert, got: #{inspect(alerts)}"
+      assert Enum.sort(wave.cids) == ["tg:1:0", "tg:2:0"]
+      assert wave.key == {"w", :budget_block_wave}
+      assert wave.evidence["count"] == 2
+      assert wave.summary =~ "2"
+
+      # blocked cids must NOT also fire individually
+      individual = Enum.filter(alerts, &(&1.type == :unanswered))
+      assert Enum.map(individual, & &1.cids) == [["tg:3:0"]]
+    end
+
+    test "a single blocked overdue cid stays an individual cause-attributed alert" do
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          ev("llm_proxy_block", "tg:1:0", 10_000, %{"reason" => "budget"})
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 16 * 60_000
+      }
+
+      {alerts, _state} = Unanswered.detect(f, ctx0)
+      assert [%{type: :unanswered, cids: ["tg:1:0"]}] = alerts
+    end
+
+    test "on_emitted marks every cid of a wave alert" do
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          ev("llm_proxy_block", "tg:1:0", 10_000, %{"reason" => "budget"}),
+          ev("request_open", "tg:2:0", 20_000),
+          ev("llm_proxy_block", "tg:2:0", 30_000, %{"reason" => "budget"})
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15},
+        state: nil,
+        now_ms: 40_000 + 16 * 60_000
+      }
+
+      {[wave], state} = Unanswered.detect(f, ctx0)
+      assert wave.type == :budget_block_wave
+
+      state = Unanswered.on_emitted(state, wave)
+      assert state["tg:1:0"].alerted == true
+      assert state["tg:2:0"].alerted == true
+
+      # already-alerted wave cids do not re-fire next tick
+      ctx1 = %{ctx0 | state: state, now_ms: ctx0.now_ms + 60_000}
+      assert {[], _} = Unanswered.detect(%{feed: {:ok, []}}, ctx1)
+    end
+
+    test "wave minimum is configurable via unanswered.wave_min" do
+      f =
+        fetched([
+          ev("request_open", "tg:1:0", 0),
+          ev("llm_proxy_block", "tg:1:0", 10_000, %{"reason" => "budget"}),
+          ev("request_open", "tg:2:0", 20_000),
+          ev("llm_proxy_block", "tg:2:0", 30_000, %{"reason" => "budget"})
+        ])
+
+      ctx0 = %{
+        swarm: "w",
+        thresholds: %{"unanswered.minutes" => 15, "unanswered.wave_min" => 3},
+        state: nil,
+        now_ms: 40_000 + 16 * 60_000
+      }
+
+      {alerts, _state} = Unanswered.detect(f, ctx0)
+      # below wave_min: two individual cause-attributed alerts, no wave
+      assert Enum.map(alerts, & &1.type) == [:unanswered, :unanswered]
     end
   end
 
