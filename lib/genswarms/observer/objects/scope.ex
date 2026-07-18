@@ -132,6 +132,7 @@ defmodule Genswarms.Observer.Objects.Scope do
   # ran, stamped onto the alert by the runner itself).
   @builtin_relay_types MapSet.new([
                          :unanswered,
+                         :budget_block_wave,
                          :delivery_failure_burst,
                          :stall,
                          :error_burst,
@@ -184,7 +185,15 @@ defmodule Genswarms.Observer.Objects.Scope do
       alert_conversation_id: cfg(config, :alert_conversation_id, nil),
       client:
         module_ref(cfg(config, :client, Genswarms.Observer.Client.Http), Genswarms.Observer.Client.Http),
-      client_opts: cfg(config, :client_opts, []),
+      client_opts: normalize_client_opts(cfg(config, :client_opts, []), cfg(config, :http_timeout_ms, nil)),
+      # Guard wall for every detector run (was hard-wired in DetectorRunner):
+      # under evening load the same-tick synchronous HTTP starves the BEAM and
+      # 2s brutal-kills healthy pure detectors into :detector_crashed noise.
+      detector_timeout_ms: normalize_pos_int(cfg(config, :detector_timeout_ms, nil), 2_000),
+      # A tick arriving this long after the previous one means the host was
+      # asleep/off: everything since is backlog, and the operator should be
+      # told ONCE instead of decoding a 07:40 alert flood.
+      gap_alert_minutes: normalize_pos_int(cfg(config, :gap_alert_minutes, nil), 30),
       now_fn: now_fn,
       deliver_fn: cfg(config, :deliver_fn, default_deliver_fn(swarm_name)),
       store_mod:
@@ -627,9 +636,15 @@ defmodule Genswarms.Observer.Objects.Scope do
 
     {state, pending_fired, pending_suppressed} = drain_pending_alerts(state, now)
 
+    # One observer-global card per gap, attached to a single (deterministic)
+    # swarm's pipeline so it rides the normal budget/log/persist machinery.
+    # It cannot refire: last_tick_ms advances at the end of THIS tick.
+    gap_swarm = state.registry |> Map.keys() |> Enum.sort() |> List.first()
+
     {state, fired, suppressed} =
       Enum.reduce(state.registry, {state, pending_fired, pending_suppressed}, fn {swarm, entry},
                                                                                   {st, fired, supp} ->
+        gap_alerts = if swarm == gap_swarm, do: tick_gap_alerts(st, swarm, now), else: []
         {data, proposed_cursor, st} = fetch(swarm, entry, st)
 
         st =
@@ -642,7 +657,15 @@ defmodule Genswarms.Observer.Objects.Scope do
         swarm_det_states = Map.get(st.det, swarm, %{})
 
         {alerts, swarm_det_states, det_health} =
-          DetectorRunner.run(detectors_for(st, swarm), data, swarm, st.thresholds, swarm_det_states, now)
+          DetectorRunner.run(
+            detectors_for(st, swarm),
+            data,
+            swarm,
+            st.thresholds,
+            swarm_det_states,
+            now,
+            st.detector_timeout_ms
+          )
 
         st = %{st | det: Map.put(st.det, swarm, swarm_det_states)}
         st = record_detector_health(st, swarm, det_health, now)
@@ -666,7 +689,7 @@ defmodule Genswarms.Observer.Objects.Scope do
 
         %{emit: budgeted, suppressed: tick_suppressed, last_alert: new_last_alert} =
           Lifecycle.process(
-            quarantine_alerts ++ alerts ++ signal_alerts,
+            gap_alerts ++ quarantine_alerts ++ alerts ++ signal_alerts,
             st.last_alert,
             st.cooldown_minutes * 60_000,
             @alert_budget_per_swarm,
@@ -1518,6 +1541,43 @@ defmodule Genswarms.Observer.Objects.Scope do
   defp cfg(config, key, default) do
     Map.get(config, key, Map.get(config, to_string(key), default))
   end
+
+  # `http_timeout_ms` is sugar over `client_opts[:timeout_ms]` — the explicit
+  # keyword (test harnesses pass [fake: pid]) always wins if both are set.
+  defp normalize_client_opts(opts, ms) when is_list(opts) and is_integer(ms) and ms > 0,
+    do: Keyword.put_new(opts, :timeout_ms, ms)
+
+  defp normalize_client_opts(opts, _) when is_list(opts), do: opts
+  defp normalize_client_opts(_, _), do: []
+
+  defp normalize_pos_int(v, _default) when is_integer(v) and v > 0, do: v
+  defp normalize_pos_int(_, default), do: default
+
+  # One :observer_gap alert when this tick arrives more than gap_alert_minutes
+  # after the previous one — the host (a laptop, typically) slept or was off.
+  # Rides the first swarm's pipeline purely for budget/log/persist plumbing;
+  # the card itself speaks as the observer, not about that swarm.
+  defp tick_gap_alerts(%{last_tick_ms: last, gap_alert_minutes: mins}, swarm, now)
+       when is_integer(last) and now - last > 0 do
+    gap_min = div(now - last, 60_000)
+
+    if gap_min > mins do
+      [
+        %{
+          type: :observer_gap,
+          swarm: swarm,
+          at_ms: now,
+          summary: "observer missed ticks for #{gap_min} min (host asleep or stopped)",
+          evidence: %{"gap_minutes" => gap_min, "from_ms" => last, "to_ms" => now},
+          key: {:observer, :observer_gap}
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  defp tick_gap_alerts(_state, _swarm, _now), do: []
 
   defp normalize_registry(registry) when is_map(registry) do
     Map.new(registry, fn {swarm, entry} ->

@@ -176,6 +176,70 @@ defmodule Genswarms.Observer.ScopeTest do
     assert Enum.any?(texts, &(&1 =~ "paste to Claude"))
   end
 
+  test "dashboard down but events alive triages as dashboard_slow, not endpoint_down" do
+    %{state: state, outbox: outbox} =
+      start_scope(
+        fixture: %{
+          "wingston" => %{
+            dashboard: {:error, :timeout},
+            events: {:ok, [%{"id" => 1, "timestamp" => iso(@t0 - 1_000), "level" => "info"}]}
+          }
+        }
+      )
+
+    {reply, _state} = decode_reply(tick(state))
+    assert reply["alerts"] == 1
+
+    [delivery] = sent(outbox)
+    msg = Jason.decode!(delivery.content)
+    assert msg["card"]["title"] =~ "slow"
+    texts = Enum.map(msg["card"]["blocks"], & &1["text"])
+    assert Enum.any?(texts, &(&1 =~ "alive"))
+  end
+
+  test "tick gap over the threshold mints ONE observer_gap card on the wake tick" do
+    %{state: state, outbox: outbox, clock: clock} = start_scope()
+
+    {_reply, state} = decode_reply(tick(state))
+    assert sent(outbox) == []
+
+    # the Mac slept for 7 hours
+    advance(clock, 7 * 60 * 60_000)
+    {_reply, state} = decode_reply(tick(state))
+
+    gap_cards =
+      outbox
+      |> sent()
+      |> Enum.map(&Jason.decode!(&1.content))
+      |> Enum.filter(&(&1["card"]["title"] =~ "blind"))
+
+    assert [card] = gap_cards
+    texts = Enum.map(card["card"]["blocks"], & &1["text"])
+    assert Enum.any?(texts, &(&1 =~ "7 h"))
+
+    # a normal 5-min cadence never fires it
+    advance(clock, 5 * 60_000)
+    {_reply, _state} = decode_reply(tick(state))
+
+    gap_cards2 =
+      outbox
+      |> sent()
+      |> Enum.map(&Jason.decode!(&1.content))
+      |> Enum.filter(&(&1["card"]["title"] =~ "blind"))
+
+    assert length(gap_cards2) == 1
+  end
+
+  test "http_timeout_ms config lands in client_opts; detector_timeout_ms is normalized" do
+    %{state: state} = start_scope(config: %{http_timeout_ms: 9_000, detector_timeout_ms: 4_000})
+    assert Keyword.get(state.client_opts, :timeout_ms) == 9_000
+    assert state.detector_timeout_ms == 4_000
+
+    %{state: default_state} = start_scope()
+    assert default_state.detector_timeout_ms == 2_000
+    assert Keyword.get(default_state.client_opts, :timeout_ms) == nil
+  end
+
   test "cooldown: same (swarm,type) is suppressed within the window and refires after" do
     %{state: state, outbox: outbox, clock: clock} =
       start_scope(fixture: %{"wingston" => %{dashboard: {:error, :econnrefused}}})

@@ -39,7 +39,7 @@ defmodule Genswarms.Observer.Outbox do
   # `recent` (the emitter's kept-alerts list) powers correlation: an unanswered
   # request minutes after an endpoint_down says "restart", not just "no reply".
   @recent_restart_window_ms 15 * 60_000
-  @investigable ~w(unanswered error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback restart_loop llm_spend_spike)a
+  @investigable ~w(unanswered budget_block_wave error_burst reply_failed_burst delivery_failure_burst budget_block pool_saturated stall health_rule detector_crashed detector_invalid detector_quarantined store_rollback restart_loop llm_spend_spike)a
 
   def alert_card(alert, entry, recent \\ [])
 
@@ -67,6 +67,13 @@ defmodule Genswarms.Observer.Outbox do
       else: "🔌 #{swarm}: dashboard unreachable"
   end
 
+  defp title_for(%{type: :dashboard_slow, swarm: swarm}),
+    do: "🐢 #{swarm}: dashboard slow — swarm alive"
+
+  defp title_for(%{type: :observer_gap}) do
+    "🌙 observer: I was blind for a while"
+  end
+
   # POSITIVE restart (Detectors.Restarted, feed_rehydrated) — vs the
   # restart-SHAPED endpoint_down inference above.
   defp title_for(%{type: :swarm_restarted, swarm: swarm} = alert) do
@@ -83,6 +90,14 @@ defmodule Genswarms.Observer.Outbox do
 
   defp title_for(%{type: :budget_block, swarm: swarm}), do: "💸 #{swarm}: LLM budget block"
 
+  defp title_for(%{type: :budget_block_wave, swarm: swarm} = alert) do
+    count = Map.get(alert.evidence || %{}, "count")
+    n = if is_integer(count), do: count, else: "several"
+    reasons = Map.get(alert.evidence || %{}, "reasons") || []
+    cause = if reasons == [], do: "LLM limits", else: Enum.join(reasons, "/")
+    "⏳ #{swarm}: #{n} conversations blocked by #{cause} limits"
+  end
+
   defp title_for(%{type: :llm_spend_spike, swarm: swarm}),
     do: "📈 #{swarm}: LLM spend spiking"
   defp title_for(%{type: :error_burst, swarm: swarm}), do: "🔥 #{swarm}: error burst"
@@ -95,6 +110,37 @@ defmodule Genswarms.Observer.Outbox do
   defp title_for(alert), do: "⚠️ observer: #{alert.swarm} · #{alert.type}"
 
   # Custom human bodies — nil falls back to alert.summary + the 💡 explanation.
+
+  # A budget-blocked unanswered user is NOT waiting for a fresh agent — their
+  # next message hits the same block until the UTC reset. Say the truth.
+  defp body_for(%{type: :unanswered, evidence: %{"blocked_reason" => reason}} = alert, _r, _e)
+       when is_binary(reason) do
+    waited = Map.get(alert.evidence || %{}, "waited_minutes")
+    mins = if is_integer(waited), do: "#{waited} min", else: "a while"
+
+    "They wrote #{mins} ago and their conversation hit its #{reason} LLM limit — " <>
+      "writing again won't help until the limit resets at 00:00 UTC. " <>
+      "Paste this to Claude to dig in, or consider the limit config if this keeps happening."
+  end
+
+  defp body_for(%{type: :budget_block_wave} = alert, _recent, _entry) do
+    ev = alert.evidence || %{}
+    count = Map.get(ev, "count")
+    n = if is_integer(count), do: count, else: "Several"
+    oldest = Map.get(ev, "oldest_waited_minutes")
+    oldest_line = if is_integer(oldest), do: " Oldest has waited #{oldest} min.", else: ""
+
+    cids =
+      case Map.get(ev, "cids") do
+        list when is_list(list) and list != [] -> "\nAffected: " <> Enum.join(list, " · ")
+        _ -> ""
+      end
+
+    "#{n} conversations wrote and got no reply because they exhausted their daily LLM limits — " <>
+      "this is one incident, not #{n} separate ones. They all recover at 00:00 UTC when limits reset; " <>
+      "until then their messages are blocked.#{oldest_line}#{cids}"
+  end
+
   defp body_for(%{type: :unanswered} = alert, recent, entry) do
     waited = Map.get(alert.evidence || %{}, "waited_minutes")
     mins = if is_integer(waited), do: "#{waited} min", else: "a while"
@@ -122,6 +168,28 @@ defmodule Genswarms.Observer.Outbox do
     if restart_shaped?(alert) do
       "The fleet API doesn't know the swarm right now — almost always a deploy rolling out or the pod rebooting. If no deploy was expected, treat this as real and check the pod."
     end
+  end
+
+  defp body_for(%{type: :dashboard_slow}, _recent, _entry) do
+    "The dashboard snapshot timed out, but the events endpoint answered — the swarm is alive; " <>
+      "only the (heavy) snapshot is failing, usually under load. Users are likely fine. " <>
+      "If this repeats, the snapshot needs a diet or the observer timeout a raise."
+  end
+
+  defp body_for(%{type: :observer_gap} = alert, _recent, _entry) do
+    ev = alert.evidence || %{}
+    mins = Map.get(ev, "gap_minutes")
+
+    dur =
+      if is_integer(mins) do
+        "#{div(mins, 60)} h #{rem(mins, 60)} m"
+      else
+        "a while"
+      end
+
+    "No tick ran for #{dur} — the machine running me was probably asleep or off. " <>
+      "Anything that happened in that window alerted late or not at all; " <>
+      "the backlog below this message is catching up, not breaking news."
   end
 
   defp body_for(%{type: :swarm_restarted} = alert, _recent, _entry) do
@@ -218,11 +286,14 @@ defmodule Genswarms.Observer.Outbox do
 
   def explain(:alerts_coalesced), do: "Too many alerts fired in one tick; inspect the evidence counts for dropped alert types."
   def explain(:budget_block), do: "The observed swarm saw an LLM budget block; check quota, budget configuration, and dependent agents."
+  def explain(:budget_block_wave), do: "Multiple unanswered conversations hit their daily LLM limits at once; they recover at the 00:00 UTC reset — review the limit config if waves recur."
   def explain(:delivery_failure_burst), do: "A conversation is repeatedly failing delivery; inspect the cid transcript and Telegram sender errors."
   def explain(:detector_crashed), do: "A detector crashed or timed out; inspect detector health and restart or patch the failing detector."
   def explain(:detector_invalid), do: "A detector returned malformed alerts; inspect the named module and fix its alert shape."
   def explain(:detector_quarantined), do: "A detector failed repeatedly and was disabled for this swarm; restart the observer after fixing it."
+  def explain(:dashboard_slow), do: "The dashboard snapshot failed while the events endpoint answered; the swarm is alive — check snapshot latency/size and the observer's http timeout."
   def explain(:endpoint_down), do: "The dashboard endpoint could not be fetched; verify the swarm process, URL, network path, and token."
+  def explain(:observer_gap), do: "The observer itself missed ticks (host asleep or stopped); alerts after the gap are backlog, and anything during it went unobserved."
   def explain(:error_burst), do: "Recent error events crossed the burst threshold; inspect the event sample and latest dashboard state."
   def explain(:health_rule), do: "A declarative health rule fired; inspect the named extension block and rule id in the evidence."
   def explain(:health_rules_gone), do: "A package block stopped publishing health_rules; check for component downtime or a dashboard regression."
