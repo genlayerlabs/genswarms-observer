@@ -53,6 +53,12 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
   # state doesn't grow unbounded.
   @alerted_ttl_ms 24 * 60 * 60 * 1000
 
+  # Non-alerted entries that never receive a reply and are never emitted
+  # (e.g. replied-ok events never arrive, or alert budget drops them) also
+  # accumulate indefinitely. Evict them after this absolute age to prevent
+  # unbounded state growth in long-running observers.
+  @max_open_age_ms 48 * 60 * 60 * 1000
+
   @impl true
   def default_thresholds, do: %{"unanswered.minutes" => 15, "unanswered.wave_min" => 2}
 
@@ -69,7 +75,7 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
 
         {alerts, new_state} = scan(tracked, ctx.swarm, minutes, wave_min, ctx.now_ms)
 
-        {alerts, prune_stale_alerted(new_state, ctx.now_ms)}
+        {alerts, prune_stale(new_state, ctx.now_ms)}
 
       # :unavailable / {:error, _} / no :feed key at all — no window, no
       # verdict: no-op with prior state (see moduledoc).
@@ -134,10 +140,13 @@ defmodule Genswarms.Observer.Detectors.Unanswered do
 
   defp normalize_state(_), do: %{}
 
-  defp prune_stale_alerted(tracked, now_ms) do
+  defp prune_stale(tracked, now_ms) do
     tracked
     |> Enum.reject(fn {_cid, info} ->
       info.alerted and now_ms - info.opened_ms > @alerted_ttl_ms
+    end)
+    |> Enum.reject(fn {_cid, info} ->
+      not info.alerted and now_ms - info.opened_ms > @max_open_age_ms
     end)
     |> Map.new()
   end
